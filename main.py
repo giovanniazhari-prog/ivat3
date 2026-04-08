@@ -97,21 +97,18 @@ def is_admin(uid: int) -> bool:
     return database.is_allowed_user(uid)
 
 
-def get_cookies() -> str:
-    saved = database.get_setting("ivasms_cookies")
+def get_cookies(uid: int) -> str:
+    """Ambil cookies iVAS milik user `uid`."""
+    saved = database.get_setting(f"ivasms_cookies_{uid}")
     if saved:
         return saved
-    raw = _cfg.get("IVASMS_COOKIES", "")
-    if isinstance(raw, dict) and raw:
-        return json.dumps(raw)
-    if isinstance(raw, str) and raw.strip():
-        return raw
     return ""
 
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
-_otp_task: asyncio.Task | None = None
+# Monitor task per user: {uid: asyncio.Task}
+_otp_tasks: dict[int, asyncio.Task | None] = {}
 
 # Cache hasil scan: list of range dicts sorted by count desc
 _scan_cache: list[dict] = []
@@ -159,10 +156,11 @@ def _fmt_stok(q: dict) -> str:
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
-def main_kb() -> ReplyKeyboardMarkup:
+def main_kb(uid: int = 0) -> ReplyKeyboardMarkup:
+    task = _otp_tasks.get(uid)
     mon = (
         "🔴 Stop Monitor OTP"
-        if (_otp_task and not _otp_task.done())
+        if (task and not task.done())
         else "🟢 Start Monitor OTP"
     )
     return ReplyKeyboardMarkup(
@@ -276,13 +274,15 @@ async def cmd_start(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    ck  = "🟢 Aktif" if get_cookies() else "🔴 Belum diset"
-    mon = "🟢 Aktif" if _otp_task and not _otp_task.done() else "⭕ Mati"
+    uid = msg.from_user.id
+    task = _otp_tasks.get(uid)
+    ck  = "🟢 Aktif" if get_cookies(uid) else "🔴 Belum diset"
+    mon = "🟢 Aktif" if (task and not task.done()) else "⭕ Mati"
     await msg.answer(
         f"<b>🤖 iVAS OTP Bot</b>\n{SEP}\n"
         f"🍪 Cookies : <b>{ck}</b>\n"
         f"📡 Monitor : <b>{mon}</b>\n"
-        f"📱 Stok Bio: <b>{database.count_numbers(msg.from_user.id)} nomor</b>\n"
+        f"📱 Stok Bio: <b>{database.count_numbers(uid)} nomor</b>\n"
         f"{SEP}\n"
         f"<b>Alur:</b>\n"
         f"1️⃣  <b>📡 Scan Range WA</b>\n"
@@ -292,7 +292,7 @@ async def cmd_start(msg: Message):
         f"5️⃣  <b>🟢 Start Monitor OTP</b> → notif real-time!\n"
         f"{SEP}\n<i>Gunakan tombol di bawah 👇</i>",
         parse_mode="HTML",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
     )
 
 
@@ -304,9 +304,11 @@ async def kb_status(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    q   = database.count_by_quality(msg.from_user.id)
-    ck  = "🟢 Aktif" if get_cookies() else "🔴 Belum diset"
-    mon = "🟢 Aktif" if _otp_task and not _otp_task.done() else "⭕ Mati"
+    uid  = msg.from_user.id
+    task = _otp_tasks.get(uid)
+    q   = database.count_by_quality(uid)
+    ck  = "🟢 Aktif" if get_cookies(uid) else "🔴 Belum diset"
+    mon = "🟢 Aktif" if (task and not task.done()) else "⭕ Mati"
     otps = database.get_today_otps()
     await msg.answer(
         f"<b>ℹ️ Status Bot</b>\n{SEP}\n"
@@ -317,7 +319,7 @@ async def kb_status(msg: Message):
         f"<b>📦 Stok Nomor Bio:</b>\n"
         + _fmt_stok(q),
         parse_mode="HTML",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
     )
 
 
@@ -370,7 +372,8 @@ async def _process_cookies(msg: Message, raw: str):
             parse_mode="HTML",
         )
         return
-    database.set_setting("ivasms_cookies", raw)
+    uid = msg.from_user.id
+    database.set_setting(f"ivasms_cookies_{uid}", raw)
     await info.edit_text(
         f"<b>✅ Cookies Disimpan!</b>\n{SEP}\nLogin iVAS sukses ✓  Bot siap! 🚀",
         parse_mode="HTML",
@@ -391,7 +394,8 @@ async def _run_scan(target):
     is_cb = isinstance(target, CallbackQuery)
     msg   = target.message if is_cb else target
 
-    cookies = get_cookies()
+    uid = target.from_user.id
+    cookies = get_cookies(uid)
     if not cookies:
         fn = msg.edit_text if is_cb else msg.answer
         await fn("🔴 Cookies belum diset! Tekan 🍪 Set Cookies dulu.", parse_mode="HTML")
@@ -596,7 +600,7 @@ async def cb_add_country(cb: CallbackQuery):
     top10   = cd["ranges"][:10]
     medals  = ["🥇","🥈","🥉"] + [f"{i}." for i in range(4, 21)]
 
-    cookies = get_cookies()
+    cookies = get_cookies(cb.from_user.id)
     if not cookies:
         await cb.message.answer("🔴 Cookies belum diset!")
         return
@@ -693,7 +697,7 @@ async def kb_return_refresh(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    cookies = get_cookies()
+    cookies = get_cookies(msg.from_user.id)
     if not cookies:
         await msg.answer("🔴 Cookies belum diset! Tekan 🍪 Set Cookies dulu.")
         return
@@ -753,7 +757,7 @@ async def cb_confirm_return_all(cb: CallbackQuery):
         return
     await cb.answer("⏳ Memproses...")
 
-    cookies = get_cookies()
+    cookies = get_cookies(cb.from_user.id)
     if not cookies:
         await cb.message.edit_text("🔴 Cookies belum diset!")
         return
@@ -811,8 +815,8 @@ async def cb_confirm_return_all(cb: CallbackQuery):
 
 # ── My Numbers ────────────────────────────────────────────────────────────────
 
-async def _show_my_numbers(msg: Message, edit: bool = False):
-    cookies = get_cookies()
+async def _show_my_numbers(msg: Message, uid: int, edit: bool = False):
+    cookies = get_cookies(uid)
     if not cookies:
         fn = msg.edit_text if edit else msg.answer
         await fn("🔴 Cookies belum diset!")
@@ -859,7 +863,7 @@ async def kb_my_numbers(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    await _show_my_numbers(msg)
+    await _show_my_numbers(msg, uid=msg.from_user.id)
 
 
 @router.callback_query(F.data == "my_numbers")
@@ -868,7 +872,7 @@ async def cb_my_numbers(cb: CallbackQuery):
         await deny(cb)
         return
     await cb.answer()
-    await _show_my_numbers(cb.message, edit=True)
+    await _show_my_numbers(cb.message, uid=cb.from_user.id, edit=True)
 
 
 @router.callback_query(F.data == "dl_txt")
@@ -877,7 +881,7 @@ async def cb_dl_txt(cb: CallbackQuery):
         await deny(cb)
         return
     await cb.answer("⏳ Downloading...")
-    cookies = get_cookies()
+    cookies = get_cookies(cb.from_user.id)
     if not cookies:
         await cb.message.answer("🔴 Cookies belum diset!")
         return
@@ -992,7 +996,12 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     m_bio    = re.search(r'\[\s*NOMOR DENGAN BIO',      content, re.IGNORECASE)
     m_nobio  = re.search(r'\[\s*NOMOR TANPA BIO',       content, re.IGNORECASE)
     m_end    = re.search(r'\[\s*NOMOR TIDAK TERDAFTAR', content, re.IGNORECASE)
-    phone_re = re.compile(r'\+?\d{7,15}')
+    phone_re = re.compile(r'\+?(\d{7,15})')
+
+    def _norm_phone(raw: str) -> str:
+        """Pastikan selalu ada + di depan dan max 15 digit."""
+        digits = raw.lstrip('+')
+        return f"+{digits}" if len(digits) <= 15 else None
 
     def _biz_type(block: str) -> str | None:
         b = block.lower()
@@ -1005,7 +1014,8 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     if m_bio:
         end = m_nobio.start() if m_nobio else (m_end.start() if m_end else len(content))
         for block in re.split(r'\[\d+\]', content[m_bio.start():end]):
-            phones = phone_re.findall(block)
+            phones = [_norm_phone(m) for m in phone_re.findall(block)]
+            phones = [p for p in phones if p]
             if not phones:
                 continue
             bio_ln  = re.search(r'Bio:\s*(.+)', block)
@@ -1021,7 +1031,8 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     if m_nobio:
         end = m_end.start() if m_end else len(content)
         for line in content[m_nobio.start():end].splitlines():
-            phones = phone_re.findall(line)
+            phones = [_norm_phone(m) for m in phone_re.findall(line)]
+            phones = [p for p in phones if p]
             if not phones:
                 continue
             biz = _biz_type(line)
@@ -1039,10 +1050,16 @@ def _gacha_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _fmt_phone(num: str) -> str:
+    """Tampilkan nomor selalu dengan + di depan."""
+    digits = num.lstrip("+")
+    return f"+{digits}" if digits.isdigit() else num
+
+
 def _send_gacha_numbers(numbers: list[tuple[str, str]]) -> str:
     lines = [f"<b>🎰 5 Nomor LMB</b>\n{SEP}"]
     for i, (num, q) in enumerate(numbers, 1):
-        lines.append(f"{i}. <code>{num}</code>  {_q_icon(q)} {_q_label(q)}")
+        lines.append(f"{i}. <code>{_fmt_phone(num)}</code>  {_q_icon(q)} {_q_label(q)}")
     return "\n".join(lines)
 
 
@@ -1205,7 +1222,7 @@ async def kb_history(msg: Message):
     for o in otps[-20:]:
         wkt = o["seen_at"][11:16] if o.get("seen_at") else "?"
         lines.append(
-            f"🕐 <i>{wkt}</i>  📱 <code>{o['phone_number']}</code>\n"
+            f"🕐 <i>{wkt}</i>  📱 <code>{_fmt_phone(o['phone_number'])}</code>\n"
             f"🔑 <code>{o['otp_message']}</code>"
         )
     text = "\n\n".join(lines)
@@ -1218,21 +1235,22 @@ async def kb_history(msg: Message):
 
 @router.message(F.text.startswith("🟢 Start Monitor OTP"))
 async def kb_start_monitor(msg: Message):
-    global _otp_task
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    if _otp_task and not _otp_task.done():
+    uid = msg.from_user.id
+    task = _otp_tasks.get(uid)
+    if task and not task.done():
         await msg.answer(
-            "⚠️ Monitor OTP sudah aktif!\nTekan 🔴 Stop Monitor OTP untuk matikan.",
-            reply_markup=main_kb(),
+            "⚠️ Monitor OTP kamu sudah aktif!\nTekan 🔴 Stop Monitor OTP untuk matikan.",
+            reply_markup=main_kb(uid),
         )
         return
-    cookies = get_cookies()
+    cookies = get_cookies(uid)
     if not cookies:
-        await msg.answer("🔴 Set cookies iVAS dulu!", reply_markup=main_kb())
+        await msg.answer("🔴 Set cookies iVAS kamu dulu!", reply_markup=main_kb(uid))
         return
-    _otp_task = asyncio.create_task(_monitor_loop(msg.bot, msg.chat.id, cookies))
+    _otp_tasks[uid] = asyncio.create_task(_monitor_loop(msg.bot, msg.chat.id, uid, cookies))
     await msg.answer(
         f"<b>🟢 Monitor OTP Aktif!</b>\n{SEP}\n"
         f"📡 Connecting ke iVAS live SMS socket...\n"
@@ -1240,43 +1258,45 @@ async def kb_start_monitor(msg: Message):
         f"   akan <b>langsung dikirim ke sini secara real-time!</b>\n\n"
         f"<i>Tekan 🔴 Stop Monitor OTP untuk berhenti.</i>",
         parse_mode="HTML",
-        reply_markup=main_kb(),
+        reply_markup=main_kb(uid),
     )
 
 
 @router.message(F.text.startswith("🔴 Stop Monitor OTP"))
 async def kb_stop_monitor(msg: Message):
-    global _otp_task
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    if _otp_task and not _otp_task.done():
-        _otp_task.cancel()
+    uid = msg.from_user.id
+    task = _otp_tasks.get(uid)
+    if task and not task.done():
+        task.cancel()
         try:
-            await _otp_task
+            await task
         except asyncio.CancelledError:
             pass
-        _otp_task = None
+        _otp_tasks[uid] = None
         await msg.answer(
             f"<b>🔴 Monitor OTP Dihentikan</b>\n{SEP}\nSocket disconnected.",
             parse_mode="HTML",
-            reply_markup=main_kb(),
+            reply_markup=main_kb(uid),
         )
     else:
-        await msg.answer("⭕ Monitor OTP sudah mati.", reply_markup=main_kb())
+        await msg.answer("⭕ Monitor OTP sudah mati.", reply_markup=main_kb(uid))
 
 
 # ── Socket Monitor Loop ───────────────────────────────────────────────────────
 
-async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
+async def _monitor_loop(bot: Bot, chat_id: int, uid: int, cookies_raw: str):
     """
-    Background task — pakai python-socketio (sama persis seperti ivass):
-    1. Ambil socket params dari /portal/live/my_sms
+    Background task per user — pakai python-socketio:
+    1. Ambil socket params dari /portal/live/my_sms (pakai cookies user sendiri)
     2. Connect socket.io ke ivasms.com:2087/livesms
-    3. Listen event → forward OTP ke Telegram
+    3. Listen event → forward OTP ke Telegram chat user
     4. Keepalive ping tiap 20 menit
     5. Auto reconnect kalau putus
     """
+    _cookies_key = f"ivasms_cookies_{uid}"
     try:
         import socketio as sio_lib
     except ImportError:
@@ -1292,13 +1312,13 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
         while True:
             await asyncio.sleep(KEEPALIVE_EVERY)
             try:
-                current_ck = database.get_setting("ivasms_cookies") or cookies_raw
+                current_ck = database.get_setting(_cookies_key) or cookies_raw
                 async with IVASMSClient(current_ck) as client:
                     ok = await client.keepalive()
                     if ok:
                         updated = client.get_updated_cookies_str()
                         if updated:
-                            database.set_setting("ivasms_cookies", updated)
+                            database.set_setting(_cookies_key, updated)
                             logger.info("Keepalive OK — cookies diperbarui di DB")
                     else:
                         logger.warning("Keepalive: session expired!")
@@ -1322,15 +1342,15 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
         ka_task = None
 
         try:
-            # Ambil cookies terbaru dari DB
-            cookies_raw = database.get_setting("ivasms_cookies") or cookies_raw
+            # Ambil cookies terbaru dari DB (per-user)
+            cookies_raw = database.get_setting(_cookies_key) or cookies_raw
 
             async with IVASMSClient(cookies_raw) as client:
                 params = await client.get_live_sms_socket_params()
                 if params:
                     updated = client.get_updated_cookies_str()
                     if updated:
-                        database.set_setting("ivasms_cookies", updated)
+                        database.set_setting(_cookies_key, updated)
                         cookies_raw = updated
 
             if not params:
@@ -1453,9 +1473,14 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         logger.debug("Empty message, skipping")
         return
 
-    # Extract OTP code dari pesan (4-8 digit berturut-turut)
-    otp_match = re.search(r'\b(\d{4,8})\b', message)
+    # Extract OTP code — support format: 123456 / 357-156 / 357 156 / 3571-56
+    otp_match = re.search(
+        r'\b(\d{3,4}[-\s]\d{3,4}|\d{4,8})\b',
+        message
+    )
     otp_code  = otp_match.group(1) if otp_match else None
+    # Versi angka bersih untuk copy (hapus dash/spasi)
+    otp_digits = re.sub(r'[-\s]', '', otp_code) if otp_code else None
 
     # Country emoji dari ISO code
     em = ""
@@ -1489,7 +1514,7 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
     notif = (
         f"🔔 {type_icon} Masuk!\n"
         f"{'─'*26}\n"
-        f"📱 Nomor  : <code>{recipient}</code>\n"
+        f"📱 Nomor  : <code>{_fmt_phone(recipient)}</code>\n"
         f"🌍 Range  : {em}<b>{rng_name}</b>\n"
         f"📨 Sender : <b>{html.escape(originator)}</b>\n"
     )
@@ -1504,21 +1529,23 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         f"{paid_icon}  |  Range: {rng_name}"
     )
 
-    # Tombol copy — hanya copy angka OTP saja, bukan teks panjang
+    # Tombol copy — tampilkan nomor penerima + OTP di label, copy angka bersih
     otp_kb = None
     if otp_code:
+        num_short  = _fmt_phone(recipient)
+        copy_value = otp_digits or otp_code   # angka bersih tanpa dash/spasi
         if _HAS_COPY_BUTTON:
             otp_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text=f"📋 Copy OTP: {otp_code}",
-                    copy_text=_CopyTextButton(text=otp_code),
+                    text=f"📋 {num_short}  →  {otp_code}",
+                    copy_text=_CopyTextButton(text=copy_value),
                 )]
             ])
         else:
             otp_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text=f"🔢 OTP: {otp_code}",
-                    callback_data=f"otp_noop",
+                    text=f"🔢 {num_short}  →  {otp_code}",
+                    callback_data="otp_noop",
                 )]
             ])
 
