@@ -1268,38 +1268,22 @@ async def kb_stop_monitor(msg: Message):
 
 async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
     """
-    Background task — pakai websockets langsung (tanpa python-socketio):
+    Background task — pakai python-socketio (sama persis seperti ivass):
     1. Ambil socket params dari /portal/live/my_sms
-    2. Connect WebSocket ke ivasms.com:2087 (Socket.io EIO=4 protocol)
-    3. Join namespace /livesms
-    4. Listen event → forward OTP ke Telegram
-    5. Keepalive ping iVAS tiap 20 menit
-    6. Auto reconnect kalau putus
+    2. Connect socket.io ke ivasms.com:2087/livesms
+    3. Listen event → forward OTP ke Telegram
+    4. Keepalive ping tiap 20 menit
+    5. Auto reconnect kalau putus
     """
     try:
-        import websockets as ws_lib
-        import ssl as ssl_module
+        import socketio as sio_lib
     except ImportError:
-        await bot.send_message(chat_id, "❌ websockets tidak terinstall!")
+        await bot.send_message(chat_id, "❌ python-socketio tidak terinstall!")
         return
-
-    # Deteksi nama parameter header sesuai versi websockets
-    # < 10.x  → extra_headers   |   >= 10.x → additional_headers
-    try:
-        _ws_ver = tuple(int(x) for x in ws_lib.__version__.split(".")[:2])
-    except Exception:
-        _ws_ver = (10, 0)
-    _HDR_PARAM = "additional_headers" if _ws_ver >= (10, 0) else "extra_headers"
-
-    # SSL context — port 2087 pakai self-signed cert, perlu skip verify
-    _ssl_ctx = ssl_module.SSLContext(ssl_module.PROTOCOL_TLS_CLIENT)
-    _ssl_ctx.check_hostname = False
-    _ssl_ctx.verify_mode   = ssl_module.CERT_NONE
 
     RECONNECT_DELAY = 20
     KEEPALIVE_EVERY = 20 * 60  # 20 menit
-    NAMESPACE       = "/livesms"
-    attempt         = 0
+    attempt = 0
 
     async def _keepalive_loop():
         """Ping iVAS tiap 20 menit, simpan cookies baru ke DB."""
@@ -1315,6 +1299,7 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
                             database.set_setting("ivasms_cookies", updated)
                             logger.info("Keepalive OK — cookies diperbarui di DB")
                     else:
+                        logger.warning("Keepalive: session expired!")
                         await bot.send_message(
                             chat_id,
                             "⚠️ <b>Session iVAS expired!</b>\n"
@@ -1329,6 +1314,8 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
     while True:
         attempt += 1
         logger.info(f"OTP monitor: attempt #{attempt}")
+        sio     = sio_lib.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
+        connected_ev = asyncio.Event()
         ka_task = None
 
         try:
@@ -1362,57 +1349,10 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
 
             logger.info(f"OTP monitor: user={user_hash[:8]} event={event_name[:20]}...")
 
-            # Socket.io EIO=4 WebSocket URL
-            ws_url = (
-                f"wss://ivasms.com:2087/socket.io/"
-                f"?EIO=4&transport=websocket"
-                f"&token={urllib.parse.quote(token, safe='')}"
-                f"&user={user_hash}"
-            )
-
-            ws_headers = {
-                "Cookie":     cookie_str,
-                "Origin":     "https://www.ivasms.com",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            }
-
-            async with ws_lib.connect(
-                ws_url,
-                **{_HDR_PARAM: ws_headers},
-                ssl=_ssl_ctx,             # skip verify — port 2087 pakai self-signed
-                ping_interval=None,       # handle manual
-                open_timeout=20,
-                close_timeout=10,
-            ) as ws:
-                # Engine.io OPEN packet: "0{...}"
-                raw = await asyncio.wait_for(ws.recv(), timeout=15)
-                logger.info(f"EIO open: {raw[:120]}")
-                if not raw.startswith("0"):
-                    raise Exception(f"EIO OPEN expected, got: {raw[:60]}")
-
-                # Join namespace /livesms (auth kosong — token sudah di query string)
-                await ws.send(f"40{NAMESPACE},")
-
-                # Tunggu namespace ACK — server bisa kirim pesan lain dulu sebelum ACK
-                ns_ok = False
-                for _attempt in range(8):
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                    logger.info(f"NS handshake [{_attempt}]: {raw[:80]}")
-                    if raw.startswith(f"40{NAMESPACE}") or (raw.startswith("40") and NAMESPACE in raw):
-                        ns_ok = True
-                        break
-                    if raw == "2":          # server ping sebelum ACK — balas dulu
-                        await ws.send("3")
-                if not ns_ok:
-                    raise Exception(f"Namespace connect gagal (last: {raw[:60]})")
-
-                # Start keepalive
-                ka_task = asyncio.create_task(_keepalive_loop())
-
+            @sio.event(namespace="/livesms")
+            async def connect():
+                connected_ev.set()
+                logger.info("OTP monitor: socket connected ✅")
                 await bot.send_message(
                     chat_id,
                     f"🟢 <b>Monitor OTP Terhubung!</b>\n"
@@ -1421,43 +1361,60 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
                     parse_mode="HTML",
                 )
 
-                # Main loop
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=35)
-                    except asyncio.TimeoutError:
-                        await ws.send("3")  # pong manual
-                        continue
+            @sio.event(namespace="/livesms")
+            async def disconnect():
+                logger.warning("OTP monitor: socket disconnected!")
 
-                    if raw == "2":
-                        # Engine.io ping → balas pong
-                        await ws.send("3")
+            @sio.on(event_name, namespace="/livesms")
+            async def on_sms(data):
+                logger.info(f"LiveSMS: {json.dumps(data, ensure_ascii=False)[:300]}")
+                try:
+                    await _forward_sms(bot, chat_id, data)
+                except Exception as exc:
+                    logger.error(f"forward_sms error: {exc}", exc_info=True)
 
-                    elif raw.startswith("42"):
-                        # Event: 42/livesms,["event_name", {data}]
-                        bracket = raw.find("[")
-                        if bracket >= 0:
-                            try:
-                                arr = json.loads(raw[bracket:])
-                                if len(arr) >= 2 and arr[0] == event_name:
-                                    logger.info(f"LiveSMS: {json.dumps(arr[1], ensure_ascii=False)[:200]}")
-                                    await _forward_sms(bot, chat_id, arr[1])
-                            except Exception as e:
-                                logger.error(f"Parse SMS event error: {e} | raw={raw[:100]}")
+            conn_url = (
+                f"https://ivasms.com:2087/livesms"
+                f"?token={urllib.parse.quote(token, safe='')}"
+                f"&user={user_hash}"
+            )
+            await sio.connect(
+                conn_url,
+                transports=["websocket"],
+                headers={"Cookie": cookie_str},
+                wait_timeout=15,
+            )
 
-                    elif raw.startswith("41"):
-                        raise Exception("Server disconnect namespace")
+            try:
+                await asyncio.wait_for(connected_ev.wait(), timeout=20)
+            except asyncio.TimeoutError:
+                await sio.disconnect()
+                raise Exception("Socket timeout — iVAS tidak merespons dalam 20s")
+
+            # Start keepalive di background
+            ka_task = asyncio.create_task(_keepalive_loop())
+
+            await sio.wait()
+            raise Exception("Socket terputus dari server iVAS")
 
         except asyncio.CancelledError:
             logger.info("OTP monitor: cancelled ✅")
             if ka_task and not ka_task.done():
                 ka_task.cancel()
+            try:
+                await sio.disconnect()
+            except Exception:
+                pass
             return
 
         except Exception as exc:
             logger.error(f"OTP monitor error: {exc}")
             if ka_task and not ka_task.done():
                 ka_task.cancel()
+            try:
+                await sio.disconnect()
+            except Exception:
+                pass
             await bot.send_message(
                 chat_id,
                 f"⚠️ <b>Monitor OTP Terputus</b>\n"
