@@ -1473,14 +1473,27 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         logger.debug("Empty message, skipping")
         return
 
-    # Extract OTP code — support format: 123456 / 357-156 / 357 156 / 3571-56
-    otp_match = re.search(
-        r'\b(\d{3,4}[-\s]\d{3,4}|\d{4,8})\b',
-        message
-    )
-    otp_code  = otp_match.group(1) if otp_match else None
-    # Versi angka bersih untuk copy (hapus dash/spasi)
-    otp_digits = re.sub(r'[-\s]', '', otp_code) if otp_code else None
+    # Extract OTP — multi-strategy supaya handle semua format WA:
+    # 1. Tepat setelah "kode" / "code" (paling akurat)
+    # 2. Digit dengan separator apapun (termasuk Unicode en-dash –)
+    # 3. Fallback: digit 4-8 tanpa separator
+    otp_code = None
+    # Strategy 1: cari "kode: 915-028" atau "code: 123456"
+    m = re.search(r'(?:kode|code)\s*[:\s]\s*(\d[\d\s\-\u2013\u2014\u2012]{2,10}\d)', message, re.IGNORECASE)
+    if m:
+        otp_code = m.group(1).strip()
+    if not otp_code:
+        # Strategy 2: digit-separator-digit (ASCII atau Unicode dash)
+        m = re.search(r'(?<!\d)(\d{3,4}[\-\u2013\u2014\u2012\s]\d{3,4})(?!\d)', message)
+        if m:
+            otp_code = m.group(1).strip()
+    if not otp_code:
+        # Strategy 3: pure digit sequence 4-8
+        m = re.search(r'(?<!\d)(\d{4,8})(?!\d)', message)
+        if m:
+            otp_code = m.group(1)
+    # Versi angka bersih untuk copy (hapus semua non-digit)
+    otp_digits = re.sub(r'\D', '', otp_code) if otp_code else None
 
     # Country emoji dari ISO code
     em = ""
