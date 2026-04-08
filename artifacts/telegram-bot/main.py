@@ -1524,21 +1524,22 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         f"{paid_icon}  |  Range: {rng_name}"
     )
 
-    # Tombol copy — hanya copy angka OTP saja, bukan teks panjang
+    # Tombol copy — tampilkan nomor penerima + OTP di label button
     otp_kb = None
     if otp_code:
+        num_short = _fmt_phone(recipient)
         if _HAS_COPY_BUTTON:
             otp_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text=f"📋 Copy OTP: {otp_code}",
+                    text=f"📋 {num_short}  →  {otp_code}",
                     copy_text=_CopyTextButton(text=otp_code),
                 )]
             ])
         else:
             otp_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text=f"🔢 OTP: {otp_code}",
-                    callback_data=f"otp_noop",
+                    text=f"🔢 {num_short}  →  {otp_code}",
+                    callback_data="otp_noop",
                 )]
             ])
 
