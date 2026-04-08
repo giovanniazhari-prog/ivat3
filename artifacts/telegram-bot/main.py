@@ -996,7 +996,12 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     m_bio    = re.search(r'\[\s*NOMOR DENGAN BIO',      content, re.IGNORECASE)
     m_nobio  = re.search(r'\[\s*NOMOR TANPA BIO',       content, re.IGNORECASE)
     m_end    = re.search(r'\[\s*NOMOR TIDAK TERDAFTAR', content, re.IGNORECASE)
-    phone_re = re.compile(r'\+?\d{7,15}')
+    phone_re = re.compile(r'\+?(\d{7,15})')
+
+    def _norm_phone(raw: str) -> str:
+        """Pastikan selalu ada + di depan dan max 15 digit."""
+        digits = raw.lstrip('+')
+        return f"+{digits}" if len(digits) <= 15 else None
 
     def _biz_type(block: str) -> str | None:
         b = block.lower()
@@ -1009,7 +1014,8 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     if m_bio:
         end = m_nobio.start() if m_nobio else (m_end.start() if m_end else len(content))
         for block in re.split(r'\[\d+\]', content[m_bio.start():end]):
-            phones = phone_re.findall(block)
+            phones = [_norm_phone(m) for m in phone_re.findall(block)]
+            phones = [p for p in phones if p]
             if not phones:
                 continue
             bio_ln  = re.search(r'Bio:\s*(.+)', block)
@@ -1025,7 +1031,8 @@ def _parse_cekbio(content: str) -> list[tuple[str, str]]:
     if m_nobio:
         end = m_end.start() if m_end else len(content)
         for line in content[m_nobio.start():end].splitlines():
-            phones = phone_re.findall(line)
+            phones = [_norm_phone(m) for m in phone_re.findall(line)]
+            phones = [p for p in phones if p]
             if not phones:
                 continue
             biz = _biz_type(line)
@@ -1043,10 +1050,16 @@ def _gacha_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _fmt_phone(num: str) -> str:
+    """Tampilkan nomor selalu dengan + di depan."""
+    digits = num.lstrip("+")
+    return f"+{digits}" if digits.isdigit() else num
+
+
 def _send_gacha_numbers(numbers: list[tuple[str, str]]) -> str:
     lines = [f"<b>🎰 5 Nomor LMB</b>\n{SEP}"]
     for i, (num, q) in enumerate(numbers, 1):
-        lines.append(f"{i}. <code>{num}</code>  {_q_icon(q)} {_q_label(q)}")
+        lines.append(f"{i}. <code>{_fmt_phone(num)}</code>  {_q_icon(q)} {_q_label(q)}")
     return "\n".join(lines)
 
 
@@ -1209,7 +1222,7 @@ async def kb_history(msg: Message):
     for o in otps[-20:]:
         wkt = o["seen_at"][11:16] if o.get("seen_at") else "?"
         lines.append(
-            f"🕐 <i>{wkt}</i>  📱 <code>{o['phone_number']}</code>\n"
+            f"🕐 <i>{wkt}</i>  📱 <code>{_fmt_phone(o['phone_number'])}</code>\n"
             f"🔑 <code>{o['otp_message']}</code>"
         )
     text = "\n\n".join(lines)
@@ -1496,7 +1509,7 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
     notif = (
         f"🔔 {type_icon} Masuk!\n"
         f"{'─'*26}\n"
-        f"📱 Nomor  : <code>{recipient}</code>\n"
+        f"📱 Nomor  : <code>{_fmt_phone(recipient)}</code>\n"
         f"🌍 Range  : {em}<b>{rng_name}</b>\n"
         f"📨 Sender : <b>{html.escape(originator)}</b>\n"
     )
