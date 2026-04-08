@@ -267,6 +267,21 @@ def is_allowed_user(uid: int) -> bool:
     return row is not None
 
 
+def migrate_orphan_numbers(admin_id: int):
+    """
+    Pindahkan semua nomor lama (owner_id=0) ke admin_id.
+    Dipanggil sekali saat startup — aman dijalankan berulang.
+    """
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE phone_numbers SET owner_id = ? WHERE owner_id = 0",
+            (admin_id,)
+        )
+        conn.commit()
+    if cur.rowcount > 0:
+        logger.info(f"Migrated {cur.rowcount} orphan numbers → owner_id={admin_id}")
+
+
 def clear_numbers(owner_id: int = 0) -> int:
     """Hapus semua nomor milik owner_id saja."""
     with get_connection() as conn:
