@@ -1,1 +1,1 @@
-worker: python artifacts/telegram-bot/main.py
+worker: python main.py
