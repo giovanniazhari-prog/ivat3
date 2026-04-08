@@ -1522,8 +1522,6 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
     else:
         type_icon = f"📨 <b>SMS dari {html.escape(originator)}</b>"
 
-    paid_icon = "💰 Paid" if paid else "⚪ Unpaid"
-
     notif = (
         f"🔔 {type_icon} Masuk!\n"
         f"{'─'*26}\n"
@@ -1533,14 +1531,9 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
     )
 
     if otp_code:
-        notif += f"🔑 <b>OTP CODE : <code>{otp_code}</code></b>\n"
+        notif += f"🔑 <b>OTP CODE : {otp_code}</b>\n"
 
-    notif += (
-        f"{'─'*26}\n"
-        f"💬 Pesan:\n<code>{html.escape(message[:300])}</code>\n"
-        f"{'─'*26}\n"
-        f"{paid_icon}  |  Range: {rng_name}"
-    )
+    notif += f"{'─'*26}"
 
     # Tombol copy — tampilkan nomor penerima + OTP di label, copy angka bersih
     otp_kb = None
