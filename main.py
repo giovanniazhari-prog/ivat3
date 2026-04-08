@@ -282,7 +282,7 @@ async def cmd_start(msg: Message):
         f"<b>🤖 iVAS OTP Bot</b>\n{SEP}\n"
         f"🍪 Cookies : <b>{ck}</b>\n"
         f"📡 Monitor : <b>{mon}</b>\n"
-        f"📱 Stok Bio: <b>{database.count_numbers()} nomor</b>\n"
+        f"📱 Stok Bio: <b>{database.count_numbers(msg.from_user.id)} nomor</b>\n"
         f"{SEP}\n"
         f"<b>Alur:</b>\n"
         f"1️⃣  <b>📡 Scan Range WA</b>\n"
@@ -304,7 +304,7 @@ async def kb_status(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    q   = database.count_by_quality()
+    q   = database.count_by_quality(msg.from_user.id)
     ck  = "🟢 Aktif" if get_cookies() else "🔴 Belum diset"
     mon = "🟢 Aktif" if _otp_task and not _otp_task.done() else "⭕ Mati"
     otps = database.get_today_otps()
@@ -946,7 +946,7 @@ async def handle_document(msg: Message):
         if not entries:
             await info.edit_text("⚠️ File cekbio terdeteksi tapi tidak ada nomor valid.")
             return
-        added, skipped = database.add_numbers_with_quality(entries)
+        added, skipped = database.add_numbers_with_quality(entries, owner_id=msg.from_user.id)
         qc: dict[str, int] = {}
         for _, q in entries:
             qc[q] = qc.get(q, 0) + 1
@@ -967,12 +967,12 @@ async def handle_document(msg: Message):
         if not numbers:
             await info.edit_text("⚠️ Tidak ada nomor valid.\nFormat: <code>+628...</code>", parse_mode="HTML")
             return
-        added, skipped = database.add_numbers_with_quality(numbers)
+        added, skipped = database.add_numbers_with_quality(numbers, owner_id=msg.from_user.id)
         await info.edit_text(
             f"<b>✅ Nomor Diproses!</b>\n{SEP}\n"
             f"📁 <code>{doc.file_name}</code>\n"
             f"✅ Ditambah : <b>{added}</b>  ⏭ Duplikat: <b>{skipped}</b>\n"
-            f"📊 Total    : <b>{database.count_numbers()}</b>",
+            f"📊 Total    : <b>{database.count_numbers(msg.from_user.id)}</b>",
             parse_mode="HTML",
         )
 
@@ -1055,15 +1055,16 @@ async def kb_gacha(msg: Message):
     chat_id = msg.chat.id
     _gacha_given.setdefault(chat_id, set())
 
-    numbers = database.get_random_numbers_exclude(count=5, exclude=_gacha_given[chat_id])
+    uid = msg.from_user.id
+    numbers = database.get_random_numbers_exclude(count=5, exclude=_gacha_given[chat_id], owner_id=uid)
 
     if not numbers:
         # Stok habis — reset dan coba lagi
         _gacha_given[chat_id].clear()
-        numbers = database.get_random_numbers_exclude(count=5, exclude=set())
+        numbers = database.get_random_numbers_exclude(count=5, exclude=set(), owner_id=uid)
 
     if not numbers:
-        q = database.count_by_quality()
+        q = database.count_by_quality(uid)
         await msg.answer(
             f"<b>🎰 Ambil Nomor</b>\n{SEP}\n"
             f"📭 Tidak ada stok LMB / bisnis!\n\n"
@@ -1076,7 +1077,7 @@ async def kb_gacha(msg: Message):
     _gacha_given[chat_id].update(n for n, _ in numbers)
     # Hapus permanen dari DB supaya tidak dikasih ke orang lain lagi
     for num, _ in numbers:
-        database.delete_number(num)
+        database.delete_number(num, uid)
     await msg.answer(_send_gacha_numbers(numbers), parse_mode="HTML", reply_markup=_gacha_kb())
 
 
@@ -1088,14 +1089,15 @@ async def cb_ganti_nomor(cb: CallbackQuery):
     await cb.answer("🔄 Mengganti nomor...")
 
     chat_id = cb.message.chat.id
+    uid = cb.from_user.id
     _gacha_given.setdefault(chat_id, set())
 
-    numbers = database.get_random_numbers_exclude(count=5, exclude=_gacha_given[chat_id])
+    numbers = database.get_random_numbers_exclude(count=5, exclude=_gacha_given[chat_id], owner_id=uid)
 
     if not numbers:
         # Semua sudah pernah dikasih — reset sesi ini
         _gacha_given[chat_id].clear()
-        numbers = database.get_random_numbers_exclude(count=5, exclude=set())
+        numbers = database.get_random_numbers_exclude(count=5, exclude=set(), owner_id=uid)
 
     if not numbers:
         await cb.message.edit_text(
@@ -1107,7 +1109,7 @@ async def cb_ganti_nomor(cb: CallbackQuery):
     _gacha_given[chat_id].update(n for n, _ in numbers)
     # Hapus permanen dari DB supaya tidak dikasih ke orang lain lagi
     for num, _ in numbers:
-        database.delete_number(num)
+        database.delete_number(num, uid)
     await cb.message.edit_text(
         _send_gacha_numbers(numbers),
         parse_mode="HTML",
@@ -1131,9 +1133,9 @@ async def cmd_hapus_nomor(msg: Message):
         )
         return
     nomor = args[1].strip().replace(" ", "")
-    ok = database.delete_number(nomor)
+    ok = database.delete_number(nomor, msg.from_user.id)
     if ok:
-        sisa = database.count_numbers()
+        sisa = database.count_numbers(msg.from_user.id)
         await msg.answer(
             f"🗑 Nomor <code>{nomor}</code> dihapus dari stok.\n"
             f"📊 Sisa stok: <b>{sisa} nomor</b>",
@@ -1151,7 +1153,7 @@ async def cmd_clear_nomor(msg: Message):
     if not is_main_admin(msg.from_user.id):
         await deny(msg)
         return
-    total = database.clear_numbers()
+    total = database.clear_numbers(msg.from_user.id)
     await msg.answer(
         f"🗑 Semua stok nomor dihapus.\n"
         f"📊 Total yang dihapus: <b>{total} nomor</b>",
@@ -1166,7 +1168,7 @@ async def kb_export_nomor(msg: Message):
     if not is_admin(msg.from_user.id):
         await deny(msg)
         return
-    numbers = database.get_all_numbers_for_export()
+    numbers = database.get_all_numbers_for_export(msg.from_user.id)
     if not numbers:
         await msg.answer("📭 Stok bio kosong! Upload dulu via 📤 Upload Nomor Bio.")
         return
