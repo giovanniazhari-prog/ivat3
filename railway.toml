@@ -1,7 +1,8 @@
 [build]
-builder = "nixpacks"
+  builder = "nixpacks"
 
-[deploy]
-startCommand = "python main.py"
-restartPolicyType = "always"
-restartPolicyMaxRetries = 10
+  [deploy]
+  startCommand = "python artifacts/telegram-bot/main.py"
+  restartPolicyType = "always"
+  restartPolicyMaxRetries = 10
+  
