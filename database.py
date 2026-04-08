@@ -20,9 +20,11 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS phone_numbers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                number TEXT UNIQUE NOT NULL,
+                number TEXT NOT NULL,
                 quality TEXT DEFAULT 'standard',
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                owner_id INTEGER NOT NULL DEFAULT 0,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(number, owner_id)
             )
         """)
         conn.execute("""
@@ -47,8 +49,13 @@ def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migrations — aman dijalankan berulang
         try:
             conn.execute("ALTER TABLE phone_numbers ADD COLUMN quality TEXT DEFAULT 'standard'")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE phone_numbers ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         conn.commit()
@@ -73,7 +80,7 @@ def set_setting(key: str, value: str):
         conn.commit()
 
 
-def add_numbers(numbers: list[str], quality: str = "standard") -> tuple[int, int]:
+def add_numbers(numbers: list[str], quality: str = "standard", owner_id: int = 0) -> tuple[int, int]:
     added = 0
     skipped = 0
     with get_connection() as conn:
@@ -83,8 +90,8 @@ def add_numbers(numbers: list[str], quality: str = "standard") -> tuple[int, int
                 continue
             try:
                 conn.execute(
-                    "INSERT INTO phone_numbers (number, quality) VALUES (?, ?)",
-                    (number, quality)
+                    "INSERT INTO phone_numbers (number, quality, owner_id) VALUES (?, ?, ?)",
+                    (number, quality, owner_id)
                 )
                 added += 1
             except sqlite3.IntegrityError:
@@ -93,7 +100,7 @@ def add_numbers(numbers: list[str], quality: str = "standard") -> tuple[int, int
     return added, skipped
 
 
-def add_numbers_with_quality(entries: list[tuple[str, str]]) -> tuple[int, int]:
+def add_numbers_with_quality(entries: list[tuple[str, str]], owner_id: int = 0) -> tuple[int, int]:
     added = 0
     skipped = 0
     with get_connection() as conn:
@@ -103,8 +110,8 @@ def add_numbers_with_quality(entries: list[tuple[str, str]]) -> tuple[int, int]:
                 continue
             try:
                 conn.execute(
-                    "INSERT INTO phone_numbers (number, quality) VALUES (?, ?)",
-                    (number, quality)
+                    "INSERT INTO phone_numbers (number, quality, owner_id) VALUES (?, ?, ?)",
+                    (number, quality, owner_id)
                 )
                 added += 1
             except sqlite3.IntegrityError:
@@ -132,67 +139,74 @@ def get_random_numbers_exclude(
     count: int = 5,
     filter_quality: str = "lmb",
     exclude: set[str] | None = None,
+    owner_id: int = 0,
 ) -> list[tuple[str, str]]:
-    """Sama dengan get_random_numbers tapi skip nomor yang ada di `exclude`."""
+    """Ambil nomor acak milik owner_id, skip nomor yang ada di `exclude`."""
     exclude = exclude or set()
     with get_connection() as conn:
         quals = BIZ_QUALITIES
         ph    = _qual_placeholders(quals)
         rows  = conn.execute(
-            f"SELECT number, quality FROM phone_numbers WHERE quality IN ({ph}) ORDER BY RANDOM() LIMIT ?",
-            (*quals, count + len(exclude) + 20)   # ambil lebih banyak lalu filter
+            f"SELECT number, quality FROM phone_numbers "
+            f"WHERE quality IN ({ph}) AND owner_id = ? "
+            f"ORDER BY RANDOM() LIMIT ?",
+            (*quals, owner_id, count + len(exclude) + 20)
         ).fetchall()
     result = [(r["number"], r["quality"]) for r in rows if r["number"] not in exclude]
     return result[:count]
 
 
-def get_random_numbers(count: int = 5, filter_quality: str = "all") -> list[tuple[str, str]]:
+def get_random_numbers(count: int = 5, filter_quality: str = "all", owner_id: int = 0) -> list[tuple[str, str]]:
     with get_connection() as conn:
         if filter_quality == "bio":
-            # Ada bio (semua tipe)
             ph = _qual_placeholders(BIO_QUALITIES)
             rows = conn.execute(
-                f"SELECT number, quality FROM phone_numbers WHERE quality IN ({ph}) ORDER BY RANDOM() LIMIT ?",
-                (*BIO_QUALITIES, count)
+                f"SELECT number, quality FROM phone_numbers "
+                f"WHERE quality IN ({ph}) AND owner_id = ? ORDER BY RANDOM() LIMIT ?",
+                (*BIO_QUALITIES, owner_id, count)
             ).fetchall()
         elif filter_quality == "bio_lmb":
-            # Bio + LMB/bisnis (tier tertinggi)
             quals = ("bio_lmb", "bio_eklusif", "bio_suite", "bio_standart")
             ph = _qual_placeholders(quals)
             rows = conn.execute(
-                f"SELECT number, quality FROM phone_numbers WHERE quality IN ({ph}) ORDER BY RANDOM() LIMIT ?",
-                (*quals, count)
+                f"SELECT number, quality FROM phone_numbers "
+                f"WHERE quality IN ({ph}) AND owner_id = ? ORDER BY RANDOM() LIMIT ?",
+                (*quals, owner_id, count)
             ).fetchall()
         elif filter_quality == "lmb":
-            # LMB/bisnis semua (bio atau tidak)
             ph = _qual_placeholders(BIZ_QUALITIES)
             rows = conn.execute(
-                f"SELECT number, quality FROM phone_numbers WHERE quality IN ({ph}) ORDER BY RANDOM() LIMIT ?",
-                (*BIZ_QUALITIES, count)
+                f"SELECT number, quality FROM phone_numbers "
+                f"WHERE quality IN ({ph}) AND owner_id = ? ORDER BY RANDOM() LIMIT ?",
+                (*BIZ_QUALITIES, owner_id, count)
             ).fetchall()
         elif filter_quality == "mix":
             rows = conn.execute(
-                "SELECT number, quality FROM phone_numbers ORDER BY RANDOM() LIMIT ?",
-                (count,)
+                "SELECT number, quality FROM phone_numbers WHERE owner_id = ? ORDER BY RANDOM() LIMIT ?",
+                (owner_id, count)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT number, quality FROM phone_numbers ORDER BY RANDOM() LIMIT ?",
-                (count,)
+                "SELECT number, quality FROM phone_numbers WHERE owner_id = ? ORDER BY RANDOM() LIMIT ?",
+                (owner_id, count)
             ).fetchall()
     return [(row["number"], row["quality"]) for row in rows]
 
 
-def count_numbers() -> int:
+def count_numbers(owner_id: int = 0) -> int:
     with get_connection() as conn:
-        row = conn.execute("SELECT COUNT(*) as total FROM phone_numbers").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) as total FROM phone_numbers WHERE owner_id = ?",
+            (owner_id,)
+        ).fetchone()
     return row["total"] if row else 0
 
 
-def count_by_quality() -> dict:
+def count_by_quality(owner_id: int = 0) -> dict:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT quality, COUNT(*) as total FROM phone_numbers GROUP BY quality"
+            "SELECT quality, COUNT(*) as total FROM phone_numbers WHERE owner_id = ? GROUP BY quality",
+            (owner_id,)
         ).fetchall()
     result = {
         "bio_eklusif": 0, "bio_suite": 0, "bio_standart": 0, "bio_lmb": 0, "bio": 0,
@@ -204,9 +218,9 @@ def count_by_quality() -> dict:
     return result
 
 
-def count_by_quality_summary() -> dict:
+def count_by_quality_summary(owner_id: int = 0) -> dict:
     """Ringkasan: total_bio, total_biz, total_standard, total_all"""
-    q = count_by_quality()
+    q = count_by_quality(owner_id)
     total_bio = sum(q[k] for k in BIO_QUALITIES if k in q)
     total_biz = sum(q[k] for k in BIZ_QUALITIES if k in q)
     return {
@@ -253,27 +267,34 @@ def is_allowed_user(uid: int) -> bool:
     return row is not None
 
 
-def clear_numbers() -> int:
+def clear_numbers(owner_id: int = 0) -> int:
+    """Hapus semua nomor milik owner_id saja."""
     with get_connection() as conn:
-        cursor = conn.execute("DELETE FROM phone_numbers")
+        cursor = conn.execute(
+            "DELETE FROM phone_numbers WHERE owner_id = ?",
+            (owner_id,)
+        )
         conn.commit()
     return cursor.rowcount
 
 
-def delete_number(number: str) -> bool:
+def delete_number(number: str, owner_id: int = 0) -> bool:
+    """Hapus nomor milik owner_id."""
     number = number.strip()
     with get_connection() as conn:
         cursor = conn.execute(
-            "DELETE FROM phone_numbers WHERE number = ?", (number,)
+            "DELETE FROM phone_numbers WHERE number = ? AND owner_id = ?",
+            (number, owner_id)
         )
         conn.commit()
     return cursor.rowcount > 0
 
 
-def get_all_numbers_for_export() -> list[tuple[str, str]]:
+def get_all_numbers_for_export(owner_id: int = 0) -> list[tuple[str, str]]:
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT number, quality FROM phone_numbers ORDER BY quality, number"
+            "SELECT number, quality FROM phone_numbers WHERE owner_id = ? ORDER BY quality, number",
+            (owner_id,)
         ).fetchall()
     return [(row["number"], row["quality"]) for row in rows]
 
