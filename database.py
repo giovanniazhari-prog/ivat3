@@ -314,11 +314,13 @@ def get_all_numbers_for_export(owner_id: int = 0) -> list[tuple[str, str]]:
     return [(row["number"], row["quality"]) for row in rows]
 
 
-def is_otp_seen(phone_number: str, otp_message: str) -> bool:
+def is_otp_seen(phone_number: str, otp_message: str, window_seconds: int = 120) -> bool:
+    """Cek apakah OTP yang sama sudah dikirim dalam `window_seconds` detik terakhir (default 2 menit)."""
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT id FROM seen_otps WHERE phone_number = ? AND otp_message = ?",
-            (phone_number, otp_message),
+            "SELECT id FROM seen_otps WHERE phone_number = ? AND otp_message = ? "
+            "AND seen_at >= datetime('now', ? || ' seconds')",
+            (phone_number, otp_message, f"-{window_seconds}"),
         ).fetchone()
     return row is not None
 
@@ -327,7 +329,8 @@ def mark_otp_seen(phone_number: str, otp_message: str):
     with get_connection() as conn:
         try:
             conn.execute(
-                "INSERT INTO seen_otps (phone_number, otp_message) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO seen_otps (phone_number, otp_message, seen_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
                 (phone_number, otp_message),
             )
             conn.commit()
