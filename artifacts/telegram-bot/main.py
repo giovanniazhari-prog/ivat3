@@ -1473,9 +1473,14 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         logger.debug("Empty message, skipping")
         return
 
-    # Extract OTP code dari pesan (4-8 digit berturut-turut)
-    otp_match = re.search(r'\b(\d{4,8})\b', message)
+    # Extract OTP code — support format: 123456 / 357-156 / 357 156 / 3571-56
+    otp_match = re.search(
+        r'\b(\d{3,4}[-\s]\d{3,4}|\d{4,8})\b',
+        message
+    )
     otp_code  = otp_match.group(1) if otp_match else None
+    # Versi angka bersih untuk copy (hapus dash/spasi)
+    otp_digits = re.sub(r'[-\s]', '', otp_code) if otp_code else None
 
     # Country emoji dari ISO code
     em = ""
@@ -1524,15 +1529,16 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         f"{paid_icon}  |  Range: {rng_name}"
     )
 
-    # Tombol copy — tampilkan nomor penerima + OTP di label button
+    # Tombol copy — tampilkan nomor penerima + OTP di label, copy angka bersih
     otp_kb = None
     if otp_code:
-        num_short = _fmt_phone(recipient)
+        num_short  = _fmt_phone(recipient)
+        copy_value = otp_digits or otp_code   # angka bersih tanpa dash/spasi
         if _HAS_COPY_BUTTON:
             otp_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text=f"📋 {num_short}  →  {otp_code}",
-                    copy_text=_CopyTextButton(text=otp_code),
+                    copy_text=_CopyTextButton(text=copy_value),
                 )]
             ])
         else:
