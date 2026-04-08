@@ -1535,7 +1535,19 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
 
     notif += f"{'─'*26}"
 
-    await bot.send_message(chat_id, notif, parse_mode="HTML")
+    otp_kb = None
+    if otp_code:
+        copy_value = otp_digits or otp_code
+        if _HAS_COPY_BUTTON:
+            otp_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"📋 {otp_code}", copy_text=_CopyTextButton(text=copy_value))
+            ]])
+        else:
+            otp_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"📋 {otp_code}", callback_data="otp_noop")
+            ]])
+
+    await bot.send_message(chat_id, notif, parse_mode="HTML", reply_markup=otp_kb)
     logger.info(f"SMS forwarded: {recipient} | {originator} | otp={otp_code} | paid={paid}")
 
 
