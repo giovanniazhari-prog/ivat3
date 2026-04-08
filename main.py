@@ -1536,6 +1536,9 @@ async def main():
         logger.warning("ADMIN_CHAT_ID tidak diset — bot akan tolak semua user!")
 
     database.init_db()
+    # Pindahkan nomor lama (owner_id=0) ke main admin — jalan sekali, aman diulang
+    if _admin_set:
+        database.migrate_orphan_numbers(next(iter(_admin_set)))
 
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher()
