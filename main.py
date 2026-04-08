@@ -1453,12 +1453,6 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
         logger.debug("Empty message, skipping")
         return
 
-    # Dedup check: jangan kirim duplikat
-    if database.is_otp_seen(recipient, message):
-        logger.warning(f"[DEDUP] OTP diblok (sudah pernah dikirim): {recipient} | {message[:60]}")
-        return
-    database.mark_otp_seen(recipient, message)
-
     # Extract OTP code dari pesan (4-8 digit berturut-turut)
     otp_match = re.search(r'\b(\d{4,8})\b', message)
     otp_code  = otp_match.group(1) if otp_match else None
