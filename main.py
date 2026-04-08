@@ -1317,7 +1317,8 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
         attempt += 1
         logger.info(f"OTP monitor: attempt #{attempt}")
         sio     = sio_lib.AsyncClient(reconnection=False, logger=False, engineio_logger=False)
-        connected_ev = asyncio.Event()
+        connected_ev   = asyncio.Event()
+        disconnected_ev = asyncio.Event()
         ka_task = None
 
         try:
@@ -1354,7 +1355,7 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
             @sio.event(namespace="/livesms")
             async def connect():
                 connected_ev.set()
-                logger.info("OTP monitor: socket connected ✅")
+                logger.info("OTP monitor: namespace /livesms connected ✅")
                 await bot.send_message(
                     chat_id,
                     f"🟢 <b>Monitor OTP Terhubung!</b>\n"
@@ -1365,15 +1366,19 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
 
             @sio.event(namespace="/livesms")
             async def disconnect():
-                logger.warning("OTP monitor: socket disconnected!")
+                # Namespace disconnect → trigger reconnect
+                logger.warning("OTP monitor: namespace /livesms DISCONNECTED — trigger reconnect")
+                disconnected_ev.set()
 
-            @sio.on(event_name, namespace="/livesms")
-            async def on_sms(data):
-                logger.info(f"LiveSMS: {json.dumps(data, ensure_ascii=False)[:300]}")
-                try:
-                    await _forward_sms(bot, chat_id, data)
-                except Exception as exc:
-                    logger.error(f"forward_sms error: {exc}", exc_info=True)
+            @sio.on("*", namespace="/livesms")
+            async def catch_all(event, data):
+                # Log semua event agar bisa debug event_name yang berbeda
+                logger.info(f"[ANY EVENT] name={event!r} data={json.dumps(data, ensure_ascii=False)[:200]}")
+                if event == event_name:
+                    try:
+                        await _forward_sms(bot, chat_id, data)
+                    except Exception as exc:
+                        logger.error(f"forward_sms error: {exc}", exc_info=True)
 
             conn_url = (
                 f"https://ivasms.com:2087/livesms"
@@ -1396,8 +1401,9 @@ async def _monitor_loop(bot: Bot, chat_id: int, cookies_raw: str):
             # Start keepalive di background
             ka_task = asyncio.create_task(_keepalive_loop())
 
-            await sio.wait()
-            raise Exception("Socket terputus dari server iVAS")
+            # Tunggu sampai namespace disconnect atau global disconnect
+            await disconnected_ev.wait()
+            raise Exception("Namespace /livesms terputus — reconnect")
 
         except asyncio.CancelledError:
             logger.info("OTP monitor: cancelled ✅")
@@ -1449,7 +1455,7 @@ async def _forward_sms(bot: Bot, chat_id: int, data: dict):
 
     # Dedup check: jangan kirim duplikat
     if database.is_otp_seen(recipient, message):
-        logger.debug(f"Duplicate OTP skipped: {recipient}")
+        logger.warning(f"[DEDUP] OTP diblok (sudah pernah dikirim): {recipient} | {message[:60]}")
         return
     database.mark_otp_seen(recipient, message)
 
