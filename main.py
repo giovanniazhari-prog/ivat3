@@ -413,6 +413,7 @@ async def cmd_autologin(msg: Message):
             "<b>❌ Login Gagal!</b>\n\n"
             "Kemungkinan penyebab:\n"
             "• Email atau password salah\n"
+            "• Verifikasi keamanan iVAS/Turnstile menolak login otomatis\n"
             "• Cloudflare masih memblok IP Railway\n"
             "• Rate limit (coba lagi dalam 1-2 menit)\n\n"
             "<b>Alternatif:</b> Login manual ke ivasms.com di browser,\n"
