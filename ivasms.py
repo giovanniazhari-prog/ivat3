@@ -209,6 +209,11 @@ async def _get_page_via_flaresolverr(
     }
     if cookies:
         body["cookies"] = cookies
+    # Kirim proxy ke FlareSolverr agar cf_clearance terikat ke IP proxy yang sama
+    # dengan request API selanjutnya → konsistensi IP → CF tidak blokir
+    if PROXY_URL:
+        body["proxy"] = {"url": PROXY_URL}
+        logger.info(f"FlareSolverr: pakai proxy {PROXY_URL.split('@')[-1]}")
 
     try:
         async with aiohttp.ClientSession() as s:
@@ -348,8 +353,7 @@ async def _login_via_flaresolverr(email: str, password: str, fs_url: str) -> dic
         return None
     finally:
         try:
-            await asyncio.sleep(0)
-            sess.close()
+            await sess.close()
         except Exception:
             pass
 
@@ -375,8 +379,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
             if resp.status_code != 200:
                 logger.warning(f"_login_via_curl_cffi [{imp}]: GET /login status {resp.status_code}")
                 try:
-                    await asyncio.sleep(0)
-                    sess.close()
+                    await sess.close()
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -387,8 +390,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
             if not m:
                 logger.warning(f"_login_via_curl_cffi [{imp}]: CSRF token tidak ditemukan")
                 try:
-                    await asyncio.sleep(0)
-                    sess.close()
+                    await sess.close()
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -428,8 +430,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
             if "/login" in final_url:
                 logger.warning(f"_login_via_curl_cffi [{imp}]: masih di /login")
                 try:
-                    await asyncio.sleep(0)
-                    sess.close()
+                    await sess.close()
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -446,8 +447,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
             if result:
                 logger.info(f"_login_via_curl_cffi [{imp}]: sukses! cookies={list(result.keys())}")
                 try:
-                    await asyncio.sleep(0)
-                    sess.close()
+                    await sess.close()
                 except Exception:
                     pass
                 return result
@@ -456,8 +456,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
             logger.error(f"_login_via_curl_cffi [{imp}]: error: {e}")
         finally:
             try:
-                await asyncio.sleep(0)
-                sess.close()
+                await sess.close()
             except Exception:
                 pass
         await asyncio.sleep(2)
@@ -483,8 +482,7 @@ class IVASMSClient:
     async def close(self):
         if self.session:
             try:
-                await asyncio.sleep(0)
-                self.session.close()
+                await self.session.close()
             except Exception:
                 pass
         self.session = None
