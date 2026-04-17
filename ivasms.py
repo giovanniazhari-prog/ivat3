@@ -107,6 +107,18 @@ JSON_HEADERS = {
 }
 
 
+def _curl_impersonate_from_ua(ua: str) -> tuple[str, int]:
+    chrome_ver = re.search(r"Chrome/(\d+)", ua)
+    chrome_num = int(chrome_ver.group(1)) if chrome_ver else 131
+    if chrome_num >= 130:
+        return "chrome131", chrome_num
+    if chrome_num >= 123:
+        return "chrome124", chrome_num
+    if chrome_num >= 116:
+        return "chrome116", chrome_num
+    return "chrome110", chrome_num
+
+
 # ── Cookie helpers ──────────────────────────────────────────────────────────
 
 def parse_cookies(raw: str) -> dict[str, str]:
@@ -197,6 +209,7 @@ async def _get_page_via_flaresolverr(
     url: str,
     fs_url: str,
     cookies: list[dict] | None = None,
+    session_id: str | None = None,
     timeout_ms: int = 60000,
 ) -> dict | None:
     """
@@ -210,6 +223,8 @@ async def _get_page_via_flaresolverr(
     }
     if cookies:
         body["cookies"] = cookies
+    if session_id:
+        body["session"] = session_id
 
     try:
         async with aiohttp.ClientSession() as s:
@@ -229,6 +244,76 @@ async def _get_page_via_flaresolverr(
                     return None
     except Exception as e:
         logger.error(f"FlareSolverr error untuk {url[:50]}: {e}")
+        return None
+
+
+async def _fs_session_create(fs_url: str, session_id: str) -> bool:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{fs_url}/v1",
+                json={"cmd": "sessions.create", "session": session_id},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                status = data.get("status")
+                if status == "ok":
+                    return True
+                logger.warning(f"_fs_session_create: status={status}, message={data.get('message')}")
+                return False
+    except Exception as e:
+        logger.error(f"_fs_session_create: {e}")
+        return False
+
+
+async def _fs_session_destroy(fs_url: str, session_id: str) -> None:
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{fs_url}/v1",
+                json={"cmd": "sessions.destroy", "session": session_id},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                await resp.json()
+    except Exception as e:
+        logger.warning(f"_fs_session_destroy: {e}")
+
+
+async def _fs_login_full(
+    email: str,
+    password: str,
+    csrf_token: str,
+    fs_url: str,
+    session_id: str,
+) -> dict | None:
+    """POST login via FlareSolverr persistent session (sama browser = same cf_clearance)."""
+    body = {
+        "cmd": "request.post",
+        "url": f"{IVASMS_BASE_URL}/login",
+        "session": session_id,
+        "postData": urllib.parse.urlencode({
+            "_token": csrf_token,
+            "email": email,
+            "password": password,
+            "remember": "on",
+        }),
+        "maxTimeout": 60000,
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{fs_url}/v1",
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=75),
+            ) as resp:
+                data = await resp.json()
+                solution = data.get("solution")
+                if not solution:
+                    logger.error(f"_fs_login_full: no solution, status={data.get('status')}, message={data.get('message')}")
+                    return None
+                return solution
+    except Exception as e:
+        logger.error(f"_fs_login_full: {e}")
         return None
 
 
@@ -270,88 +355,74 @@ async def login_with_credentials(email: str, password: str) -> dict | None:
 
 async def _login_via_flaresolverr(email: str, password: str, fs_url: str) -> dict | None:
     """Login via FlareSolverr: real Chromium browser → bypass CF sepenuhnya."""
-    # Step 1: GET /login via FlareSolverr
-    solution = await _get_page_via_flaresolverr(
-        f"{IVASMS_BASE_URL}/login",
-        fs_url,
-        timeout_ms=60000,
-    )
-    if not solution:
-        logger.error("_login_via_flaresolverr: FlareSolverr GET /login gagal")
+    session_id = f"ivasms-login-{os.getpid()}-{id(email)}"
+    session_created = await _fs_session_create(fs_url, session_id)
+    if not session_created:
+        logger.error("_login_via_flaresolverr: gagal membuat FlareSolverr session")
         return None
 
-    html_page = solution.get("response", "")
-    ua = solution.get("userAgent") or DEFAULT_HEADERS["User-Agent"]
-
-    # Extract CSRF token
-    m = re.search(r'name="_token"\s+value="([^"]+)"', html_page)
-    if not m:
-        logger.error("_login_via_flaresolverr: CSRF token tidak ditemukan di halaman login")
-        return None
-
-    csrf_token = m.group(1)
-
-    # Extract CF cookies dari FlareSolverr
-    cf_cookies: dict[str, str] = {}
-    for ck in solution.get("cookies", []):
-        n, v = ck.get("name"), ck.get("value")
-        if n and v:
-            cf_cookies[n] = v
-
-    logger.info(
-        f"_login_via_flaresolverr: CF cookies={list(cf_cookies.keys())}, CSRF={csrf_token[:10]}..."
-    )
-
-    # Step 2: POST /login via curl_cffi dengan CF cookies dari FlareSolverr
-    sess = CurlSession(impersonate="chrome131", headers={**DEFAULT_HEADERS, "User-Agent": ua})
     try:
-        sess.cookies.update(cf_cookies)
-        await asyncio.sleep(1)
-        resp = await sess.post(
+        solution = await _get_page_via_flaresolverr(
             f"{IVASMS_BASE_URL}/login",
-            data={
-                "_token": csrf_token,
-                "email": email,
-                "password": password,
-                "remember": "on",
-            },
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": f"{IVASMS_BASE_URL}/login",
-                "Origin": IVASMS_BASE_URL,
-            },
-            allow_redirects=True,
-            timeout=30,
+            fs_url,
+            session_id=session_id,
+            timeout_ms=60000,
         )
-        final_url = str(resp.url)
-        logger.info(f"_login_via_flaresolverr: POST → url={final_url} status={resp.status_code}")
+        if not solution:
+            logger.error("_login_via_flaresolverr: FlareSolverr GET /login gagal")
+            return None
+
+        html_page = solution.get("response", "")
+
+        m = re.search(r'name="_token"\s+value="([^"]+)"', html_page)
+        if not m:
+            logger.error("_login_via_flaresolverr: CSRF token tidak ditemukan di halaman login")
+            return None
+
+        csrf_token = m.group(1)
+        get_cookies: dict[str, str] = {}
+        for ck in solution.get("cookies", []):
+            n, v = ck.get("name"), ck.get("value")
+            if n and v:
+                get_cookies[n] = v
+
+        logger.info(
+            f"_login_via_flaresolverr: session={session_id}, cookies={list(get_cookies.keys())}, CSRF={csrf_token[:10]}..."
+        )
+
+        post_solution = await _fs_login_full(email, password, csrf_token, fs_url, session_id)
+        if not post_solution:
+            return None
+
+        final_url = str(post_solution.get("url", ""))
+        status = post_solution.get("status", 0)
+        logger.info(f"_login_via_flaresolverr: FS POST → url={final_url} status={status}")
 
         if "/login" in final_url:
-            body = resp.text
+            body = post_solution.get("response", "")
             if any(kw in body.lower() for kw in ["invalid", "incorrect", "salah", "wrong"]):
                 logger.error("_login_via_flaresolverr: credentials tidak valid")
             else:
                 logger.warning("_login_via_flaresolverr: masih di /login — CF masih blok POST")
             return None
 
-        # Merge semua cookies
-        result: dict[str, str] = dict(cf_cookies)
-        try:
-            for name, value in sess.cookies.items():
-                if name and value:
-                    result[name] = value
-        except Exception:
-            pass
+        result: dict[str, str] = dict(get_cookies)
+        for ck in post_solution.get("cookies", []):
+            n, v = ck.get("name"), ck.get("value")
+            if n and v:
+                result[n] = v
+
+        if not result:
+            logger.error("_login_via_flaresolverr: login terlihat sukses tapi cookies kosong")
+            return None
+
         logger.info(f"_login_via_flaresolverr: sukses! cookies={list(result.keys())}")
         return result
     except Exception as e:
-        logger.error(f"_login_via_flaresolverr: curl_cffi POST error: {e}")
+        logger.error(f"_login_via_flaresolverr: FlareSolverr session login error: {e}")
         return None
     finally:
-        try:
-            await sess.close()
-        except Exception:
-            pass
+        await _fs_session_destroy(fs_url, session_id)
 
 
 async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
@@ -468,11 +539,17 @@ class IVASMSClient:
         self.cookies: dict[str, str] = parse_cookies(cookies_raw)
         self.csrf_token: str | None = None
         self.session: CurlSession | None = None
+        self.flaresolverr_ua: str | None = None
 
     async def open(self):
         if self.session and not self.session.closed:
             return
-        self.session = CurlSession(impersonate="chrome131", headers=DEFAULT_HEADERS)
+        ua = self.flaresolverr_ua or DEFAULT_HEADERS["User-Agent"]
+        imp, chrome_num = _curl_impersonate_from_ua(ua)
+        if self.flaresolverr_ua:
+            logger.info(f"IVASMSClient.open: using impersonate={imp}, UA Chrome/{chrome_num}")
+        self.session = CurlSession(impersonate=imp)
+        self.session.headers.update({**DEFAULT_HEADERS, "User-Agent": ua})
         self._apply_cookies()
 
     async def close(self):
@@ -545,8 +622,12 @@ class IVASMSClient:
             if solution:
                 final_url = solution.get("url", "")
                 html = solution.get("response", "")
+                fs_ua = solution.get("userAgent")
+                if fs_ua:
+                    self.flaresolverr_ua = fs_ua
+                    await self.close()
+                    await self.open()
 
-                # Update cookies dari FlareSolverr response
                 for ck in solution.get("cookies", []):
                     name, value = ck.get("name"), ck.get("value")
                     if name and value:
