@@ -43,6 +43,7 @@ load_dotenv()
 import database
 from ivasms import (
     IVASMSClient,
+    login_with_credentials,
     _country_emoji,
     xlsx_bytes_to_numbers,
     numbers_to_txt,
@@ -376,6 +377,52 @@ async def _process_cookies(msg: Message, raw: str):
     database.set_setting(f"ivasms_cookies_{uid}", raw)
     await info.edit_text(
         f"<b>✅ Cookies Disimpan!</b>\n{SEP}\nLogin iVAS sukses ✓  Bot siap! 🚀",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📡 Scan Range WA Sekarang", callback_data="scan_range")]
+        ]),
+    )
+
+
+@router.message(Command("autologin"))
+async def cmd_autologin(msg: Message):
+    if not is_admin(msg.from_user.id):
+        await deny(msg)
+        return
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await msg.answer(
+            "Gunakan: <code>/autologin email password</code>\n\nContoh:\n<code>/autologin ntazis72@gmail.com Azis12345_</code>",
+            parse_mode="HTML",
+        )
+        return
+    _, email, password = parts
+    info = await msg.answer("⏳ Sedang login ke iVAS... (bisa 30–60 detik)")
+    try:
+        cookies = await login_with_credentials(email.strip(), password.strip())
+    except Exception as e:
+        logger.error(f"autologin error: {e}")
+        cookies = None
+    if not cookies:
+        await info.edit_text(
+            "<b>❌ Login Gagal!</b>\n\nKemungkinan:\n• Email atau password salah\n• Cloudflare masih blok\n\nCoba kirim ulang atau hubungi admin.",
+            parse_mode="HTML",
+        )
+        return
+    raw = json.dumps(cookies)
+    try:
+        async with IVASMSClient(raw) as client:
+            ok = await client.login()
+            if ok:
+                updated = client.get_updated_cookies_str()
+                if updated:
+                    raw = updated
+    except Exception as e:
+        logger.error(f"autologin validate: {e}")
+    uid = msg.from_user.id
+    database.set_setting(f"ivasms_cookies_{uid}", raw)
+    await info.edit_text(
+        f"<b>✅ Auto Login Berhasil!</b>\n{SEP}\nCookies disimpan otomatis. Bot siap! 🚀",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📡 Scan Range WA Sekarang", callback_data="scan_range")]
