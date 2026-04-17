@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 IVASMS_BASE_URL = "https://www.ivasms.com"
 SOCKET_URL = "https://ivasms.com:2087"
-  FLARESOLVERR_URL = "http://flaresolverr.railway.internal:8191"
+FLARESOLVERR_URL = "http://flaresolverr.railway.internal:8191"
 
 # ── Country name → emoji ────────────────────────────────────────────────────
 
@@ -165,31 +165,31 @@ def numbers_to_txt(numbers: list[str]) -> bytes:
 
 
 
-  async def _get_cookies_via_flaresolverr(url: str, flaresolverr_url: str) -> dict:
-      """Gunakan FlareSolverr untuk solve Cloudflare challenge dan ambil cookies."""
-      try:
-          async with aiohttp.ClientSession() as s:
-              async with s.post(
-                  f"{flaresolverr_url}/v1",
-                  json={
-                      "cmd": "request.get",
-                      "url": url,
-                      "maxTimeout": 60000,
-                  },
-                  timeout=aiohttp.ClientTimeout(total=70),
-              ) as resp:
-                  data = await resp.json()
-                  cookies = {}
-                  for c in data.get("solution", {}).get("cookies", []):
-                      cookies[c["name"]] = c["value"]
-                  logger.info(f"FlareSolverr: got {len(cookies)} cookies")
-                  return cookies
-      except Exception as e:
-          logger.warning(f"FlareSolverr error (will continue without CF cookies): {e}")
-          return {}
+async def _get_cookies_via_flaresolverr(url: str, flaresolverr_url: str) -> dict:
+    """Gunakan FlareSolverr untuk solve Cloudflare challenge dan ambil cookies."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{flaresolverr_url}/v1",
+                json={
+                    "cmd": "request.get",
+                    "url": url,
+                    "maxTimeout": 60000,
+                },
+                timeout=aiohttp.ClientTimeout(total=70),
+            ) as resp:
+                data = await resp.json()
+                cookies = {}
+                for c in data.get("solution", {}).get("cookies", []):
+                    cookies[c["name"]] = c["value"]
+                logger.info(f"FlareSolverr: got {len(cookies)} cookies")
+                return cookies
+    except Exception as e:
+        logger.warning(f"FlareSolverr error (will continue without CF cookies): {e}")
+        return {}
 
 
-  # ── iVAS HTTP Client ─────────────────────────────────────────────────────────
+# ── iVAS HTTP Client ─────────────────────────────────────────────────────────
 
 class IVASMSClient:
     def __init__(self, cookies_raw: str):
