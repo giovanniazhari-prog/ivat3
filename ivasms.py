@@ -1,5 +1,6 @@
 """
-iVAS SMS Client — Full HTTP + Socket client untuk ivasms.com
+iVAS SMS Client — HTTP client untuk ivasms.com
+Menggunakan curl_cffi dengan Chrome impersonation untuk bypass Cloudflare.
 """
 import asyncio
 import io
@@ -16,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 IVASMS_BASE_URL = "https://www.ivasms.com"
 SOCKET_URL = "https://ivasms.com:2087"
-FLARESOLVERR_URL = "http://flaresolverr.railway.internal:8191"
 
 # ── Country name → emoji ────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -69,7 +69,7 @@ DEFAULT_HEADERS = {
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
-    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
     "Sec-CH-UA-Mobile": "?0",
     "Sec-CH-UA-Platform": '"Windows"',
     "Cache-Control": "max-age=0",
@@ -83,7 +83,7 @@ JSON_HEADERS = {
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
-    "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-CH-UA": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
     "Sec-CH-UA-Mobile": "?0",
     "Sec-CH-UA-Platform": '"Windows"',
 }
@@ -165,79 +165,89 @@ def numbers_to_txt(numbers: list[str]) -> bytes:
     return "\n".join(numbers).encode("utf-8")
 
 
-
-async def _get_cookies_via_flaresolverr(url: str, flaresolverr_url: str) -> dict:
-    """Gunakan FlareSolverr untuk solve Cloudflare challenge dan ambil cookies."""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{flaresolverr_url}/v1",
-                json={
-                    "cmd": "request.get",
-                    "url": url,
-                    "maxTimeout": 60000,
-                },
-                timeout=70,
-            ) as resp:
-                data = await resp.json()
-                cookies = {}
-                for c in data.get("solution", {}).get("cookies", []):
-                    cookies[c["name"]] = c["value"]
-                logger.info(f"FlareSolverr: got {len(cookies)} cookies")
-                return cookies
-    except Exception as e:
-        logger.warning(f"FlareSolverr error (will continue without CF cookies): {e}")
-        return {}
-
-
+# ── Login dengan credentials langsung (tanpa FlareSolverr) ──────────────────
 
 async def login_with_credentials(email: str, password: str) -> dict | None:
     """
     Login ke ivasms.com menggunakan email dan password.
-    Step 1: FlareSolverr GET /login  → dapat cf_clearance + CSRF token
-    Step 2: curl_cffi POST /login    → dapat session cookies
+    Menggunakan curl_cffi dengan Chrome impersonation untuk bypass Cloudflare.
+    
+    Step 1: GET /login — ambil cf_clearance + CSRF token via curl_cffi (chrome impersonation)
+    Step 2: POST /login — kirim credentials dengan cookies yang sama
+    
     Returns: cookies dict kalau sukses, None kalau gagal.
     """
-    # Step 1: GET halaman login via FlareSolverr (real Chromium, bypass CF)
+    # Gunakan impersonasi Chrome terbaru untuk bypass CF
+    impersonate_versions = ["chrome131", "chrome124", "chrome110"]
+    
+    for imp in impersonate_versions:
+        logger.info(f"login_with_credentials: mencoba dengan {imp}")
+        result = await _try_login(email, password, imp)
+        if result is not None:
+            return result
+        await asyncio.sleep(2)
+    
+    logger.error("login_with_credentials: semua impersonation gagal")
+    return None
+
+
+async def _try_login(email: str, password: str, impersonate: str) -> dict | None:
+    """Satu percobaan login dengan impersonation tertentu."""
+    sess = CurlSession(impersonate=impersonate, headers=DEFAULT_HEADERS)
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{FLARESOLVERR_URL}/v1",
-                json={"cmd": "request.get", "url": f"{IVASMS_BASE_URL}/login", "maxTimeout": 60000},
-                timeout=aiohttp.ClientTimeout(total=75),
-            ) as resp:
-                data = await resp.json()
-    except Exception as e:
-        logger.error(f"login_with_credentials: FlareSolverr GET error: {e}")
-        return None
-
-    solution = data.get("solution", {})
-    if solution.get("status") != 200:
-        logger.error(f"login_with_credentials: FlareSolverr GET failed status={solution.get('status')}")
-        return None
-
-    html_page = solution.get("response", "")
-    m = re.search(r'name="_token"\s+value="([^"]+)"', html_page)
-    if not m:
-        logger.error("login_with_credentials: CSRF token tidak ada di halaman login")
-        return None
-
-    csrf_token = m.group(1)
-    ua = solution.get("userAgent") or DEFAULT_HEADERS["User-Agent"]
-
-    # Extract CF cookies dari FlareSolverr
-    cf_cookies: dict[str, str] = {}
-    for ck in solution.get("cookies", []):
-        n, v = ck.get("name"), ck.get("value")
-        if n and v:
-            cf_cookies[n] = v
-    logger.info(f"login_with_credentials: CF cookies: {list(cf_cookies.keys())}, CSRF={csrf_token[:10]}...")
-
-    # Step 2: POST login via curl_cffi dengan CF cookies (sama IP Railway = cf_clearance valid)
-    sess = CurlSession(impersonate="chrome124", headers={**DEFAULT_HEADERS, "User-Agent": ua})
-    try:
-        sess.cookies.update(cf_cookies)
-        resp = await sess.post(
+        # Step 1: GET halaman login
+        resp = await sess.get(
+            f"{IVASMS_BASE_URL}/login",
+            allow_redirects=True,
+            timeout=30,
+        )
+        
+        logger.info(f"_try_login [{impersonate}]: GET /login status={resp.status_code}")
+        
+        if resp.status_code not in (200, 302, 301):
+            logger.warning(f"_try_login [{impersonate}]: GET /login unexpected status {resp.status_code}")
+            return None
+        
+        html_page = resp.text
+        
+        # Extract CSRF token
+        m = re.search(r'name="_token"\s+value="([^"]+)"', html_page)
+        if not m:
+            # Coba pola lain
+            m = re.search(r'"_token"\s*:\s*"([^"]+)"', html_page)
+        if not m:
+            m = re.search(r'csrf[_-]token.*?content="([^"]+)"', html_page, re.IGNORECASE)
+        
+        if not m:
+            logger.warning(f"_try_login [{impersonate}]: CSRF token tidak ditemukan di halaman login")
+            # Mungkin CF challenge — simpan cookies saja untuk nanti
+            cf_cookies = {}
+            try:
+                for name, value in sess.cookies.items():
+                    if name and value:
+                        cf_cookies[name] = value
+            except Exception:
+                pass
+            logger.info(f"_try_login [{impersonate}]: CF cookies sejauh ini: {list(cf_cookies.keys())}")
+            return None
+        
+        csrf_token = m.group(1)
+        logger.info(f"_try_login [{impersonate}]: CSRF={csrf_token[:10]}...")
+        
+        # Ambil cookies dari GET response
+        get_cookies_dict = {}
+        try:
+            for name, value in sess.cookies.items():
+                if name and value:
+                    get_cookies_dict[name] = value
+        except Exception:
+            pass
+        logger.info(f"_try_login [{impersonate}]: Cookies setelah GET: {list(get_cookies_dict.keys())}")
+        
+        # Step 2: POST /login dengan cookies yang sudah ada
+        await asyncio.sleep(1)  # Jeda kecil agar terlihat natural
+        
+        resp2 = await sess.post(
             f"{IVASMS_BASE_URL}/login",
             data={
                 "_token": csrf_token,
@@ -253,22 +263,37 @@ async def login_with_credentials(email: str, password: str) -> dict | None:
             allow_redirects=True,
             timeout=30,
         )
-        final_url = str(resp.url)
-        logger.info(f"login_with_credentials: POST → url={final_url} status={resp.status_code}")
-
+        
+        final_url = str(resp2.url)
+        logger.info(f"_try_login [{impersonate}]: POST /login → url={final_url} status={resp2.status_code}")
+        
         if "/login" in final_url:
-            logger.error("login_with_credentials: masih di /login — credentials salah atau CF blok")
+            # Cek apakah ada pesan error di halaman
+            body = resp2.text
+            if "password" in body.lower() and ("invalid" in body.lower() or "incorrect" in body.lower() or "salah" in body.lower()):
+                logger.error(f"_try_login [{impersonate}]: credentials tidak valid")
+            else:
+                logger.warning(f"_try_login [{impersonate}]: masih di /login — kemungkinan CF masih blok")
             return None
-
-        # Merge semua cookies
-        result: dict[str, str] = dict(cf_cookies)
-        for name, value in sess.cookies.items():
-            if name and value:
-                result[name] = value
-        logger.info(f"login_with_credentials: sukses! cookies={list(result.keys())}")
+        
+        # Kumpulkan semua cookies
+        result: dict[str, str] = {}
+        try:
+            for name, value in sess.cookies.items():
+                if name and value:
+                    result[name] = value
+        except Exception:
+            pass
+        
+        if not result:
+            logger.error(f"_try_login [{impersonate}]: login berhasil tapi tidak ada cookies!")
+            return None
+        
+        logger.info(f"_try_login [{impersonate}]: sukses! cookies={list(result.keys())}")
         return result
+        
     except Exception as e:
-        logger.error(f"login_with_credentials: curl_cffi POST error: {e}")
+        logger.error(f"_try_login [{impersonate}]: error: {e}")
         return None
     finally:
         try:
@@ -288,7 +313,7 @@ class IVASMSClient:
     async def open(self):
         if self.session and not self.session.closed:
             return
-        self.session = CurlSession(impersonate="chrome124", headers=DEFAULT_HEADERS)
+        self.session = CurlSession(impersonate="chrome131", headers=DEFAULT_HEADERS)
         self._apply_cookies()
 
     async def close(self):
@@ -324,59 +349,76 @@ class IVASMSClient:
         return json.dumps(merged) if merged else ""
 
     async def login(self) -> bool:
-        """Login via FlareSolverr — real Chromium, bypass CF TLS fingerprinting."""
-        # Kirim cookies user ke FlareSolverr agar dia load halaman pakai Chrome beneran
-        fs_cookies = []
-        for name, value in self.cookies.items():
-            domain = ".ivasms.com" if name in ("cf_clearance", "_fbp", "__cf_bm") else "www.ivasms.com"
-            fs_cookies.append({"name": name, "value": value, "domain": domain, "path": "/"})
+        """
+        Verifikasi cookies dengan mengakses halaman portal.
+        Menggunakan curl_cffi dengan Chrome impersonation.
+        """
+        if not self.session:
+            await self.open()
 
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    f"{FLARESOLVERR_URL}/v1",
-                    json={
-                        "cmd": "request.get",
-                        "url": f"{IVASMS_BASE_URL}/portal/sms/received",
-                        "maxTimeout": 60000,
-                        "cookies": fs_cookies,
-                    },
-                    timeout=75,
-                ) as resp:
-                    data = await resp.json()
+            resp = await self.session.get(
+                f"{IVASMS_BASE_URL}/portal/sms/received",
+                allow_redirects=True,
+                timeout=30,
+            )
+            
+            final_url = str(resp.url)
+            status = resp.status_code
+            html = resp.text
+            
+            logger.info(f"login: GET /portal/sms/received → url={final_url} status={status}")
+            
+            # Update cookies dari response
+            try:
+                for name, value in self.session.cookies.items():
+                    if name and value:
+                        self.cookies[name] = value
+            except Exception:
+                pass
+            self._apply_cookies()
+            
+            if "/login" in final_url or status in (301, 302, 403):
+                logger.error(f"login: diredirect ke /login atau 403 — cookies invalid/expired")
+                return False
+            
+            # Cari CSRF token
+            m = re.search(r'name="_token"\s+value="([^"]+)"', html)
+            if m:
+                self.csrf_token = m.group(1)
+                logger.info(f"login: sukses! CSRF={self.csrf_token[:10]}...")
+                return True
+            
+            # Halaman berhasil diload tapi tidak ada CSRF — cek apakah memang portal
+            if "portal" in final_url.lower() or "dashboard" in html.lower():
+                # Coba ambil CSRF dari endpoint lain
+                logger.warning("login: CSRF tidak ditemukan, mencoba halaman dashboard...")
+                resp2 = await self.session.get(
+                    f"{IVASMS_BASE_URL}/portal/dashboard",
+                    allow_redirects=True,
+                    timeout=20,
+                )
+                html2 = resp2.text
+                m2 = re.search(r'name="_token"\s+value="([^"]+)"', html2)
+                if m2:
+                    self.csrf_token = m2.group(1)
+                    logger.info("login: CSRF dari dashboard OK")
+                    return True
+                # Tetap anggap login berhasil jika tidak di halaman login
+                if "/login" not in str(resp2.url):
+                    logger.info("login: session valid (tanpa CSRF — fitur yang butuh POST akan terbatas)")
+                    return True
+            
+            logger.error("login: CSRF tidak ditemukan dan tidak ada portal page")
+            return False
+            
         except Exception as e:
-            logger.error(f"login FlareSolverr error: {e}")
+            logger.error(f"login: {e}")
             return False
-
-        solution = data.get("solution", {})
-        status = solution.get("status", 0)
-        html = solution.get("response", "")
-        final_url = solution.get("url", "")
-
-        # Merge semua cookies dari FlareSolverr (CF clearance + session) ke session kita
-        for ck in solution.get("cookies", []):
-            name, value = ck.get("name"), ck.get("value")
-            if name and value:
-                self.cookies[name] = value
-        self._apply_cookies()
-
-        if "/login" in final_url or status != 200:
-            logger.error(f"login via FS: HTTP {status}, url={final_url}")
-            return False
-
-        m = re.search(r'name="_token"\s+value="([^"]+)"', html)
-        if m:
-            self.csrf_token = m.group(1)
-            logger.info("Login OK via FlareSolverr — CSRF acquired")
-            return True
-
-        logger.error("CSRF not found — cookies mungkin expired")
-        return False
 
     async def keepalive(self) -> bool:
         """
         Ping /portal/dashboard untuk jaga session tetap hidup.
-        Sekaligus update cookies dari session jar (cookie bisa diperbarui server).
         Panggil tiap 20 menit supaya session tidak expired.
         Returns True kalau session masih valid.
         """
@@ -387,18 +429,15 @@ class IVASMSClient:
                 timeout=15,
             )
             html = resp.text
-            # Kalau diredirect ke /login berarti session sudah mati
             if "/login" in str(resp.url):
                 logger.warning("keepalive: session expired (redirected to login)")
                 return False
-            # Update cookies dari session
             try:
                 for name, value in self.session.cookies.items():
                     if name and value:
                         self.cookies[name] = value
             except Exception:
                 pass
-            # Update CSRF kalau ada di halaman
             m = re.search(r'name="_token"\s+value="([^"]+)"', html)
             if m:
                 self.csrf_token = m.group(1)
@@ -414,8 +453,6 @@ class IVASMSClient:
         """
         Scan /portal/sms/test/sms?search=WhatsApp
         Returns top ranges sorted by WhatsApp SMS count (desc).
-        Each item: {range, termination_id, country, range_num, count, last_seen}
-        Butuh X-XSRF-TOKEN header dari cookie.
         """
         xsrf = _xsrf_header(self.cookies)
         params = {
@@ -486,7 +523,6 @@ class IVASMSClient:
         """
         POST /portal/numbers/termination/number/add
         Returns {ok: bool, message: str}
-        Auto-retry kalau kena HTTP 429 (rate limit) — tunggu 5 detik lalu coba lagi.
         """
         if not self.csrf_token:
             return {"ok": False, "message": "No CSRF token — login() dulu"}
@@ -504,7 +540,7 @@ class IVASMSClient:
                     timeout=15,
                 )
                 if resp.status_code == 429:
-                    wait = 5 * (attempt + 1)   # 5s, 10s, 15s
+                    wait = 5 * (attempt + 1)
                     logger.warning(f"add_range: 429 rate limit, tunggu {wait}s (attempt {attempt+1}/{retry_on_429+1})")
                     if attempt < retry_on_429:
                         await asyncio.sleep(wait)
@@ -525,7 +561,6 @@ class IVASMSClient:
         """
         POST /portal/numbers/return/allnumber/bluck
         Return semua nomor di My Numbers sekaligus.
-        Response: {"NumberDoneRemove":"all numbers","count":1000,"message":"..."}
         """
         if not self.csrf_token:
             return {"ok": False, "count": 0, "message": "No CSRF token — login() dulu"}
@@ -608,10 +643,7 @@ class IVASMSClient:
 
     async def get_live_sms_socket_params(self) -> dict | None:
         """
-        Fetch /portal/live/my_sms, extract params untuk connect socket.io:
-          - token: connection query param
-          - user: user hash
-          - event_name: encrypted event key
+        Fetch /portal/live/my_sms, extract params untuk connect socket.io.
         Returns None kalau gagal.
         """
         try:
@@ -627,19 +659,16 @@ class IVASMSClient:
             logger.error(f"get_live_sms_socket_params: {e}")
             return None
 
-        # Extract token
         m_token = re.search(r"token:\s*'([^']+)'", html)
         if not m_token:
             logger.error("get_live_sms_socket_params: token not found")
             return None
 
-        # Extract user hash
         m_user = re.search(r'user:\s*"([a-f0-9]{32})"', html)
         if not m_user:
             logger.error("get_live_sms_socket_params: user hash not found")
             return None
 
-        # Extract event name (base64 encoded string after liveSMSSocket.on)
         m_event = re.search(
             r'liveSMSSocket\.on\("([A-Za-z0-9+/]+=*)"',
             html,
@@ -662,7 +691,6 @@ class IVASMSClient:
         """
         POST /portal/sms/received/getsms with today's date.
         Returns list of {number, originator, message, time}.
-        Note: response is HTML, parsed with regex.
         """
         if not self.csrf_token:
             return []
