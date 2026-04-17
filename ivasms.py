@@ -1,7 +1,7 @@
 """
 iVAS SMS Client — HTTP client untuk ivasms.com
-Menggunakan FlareSolverr (real Chromium) untuk bypass Cloudflare.
-Fallback ke curl_cffi Chrome impersonation jika FlareSolverr tidak tersedia.
+Menggunakan SOCKS5 residential proxy (owlproxy) + curl_cffi Chrome impersonation.
+Semua request ke ivasms.com melalui proxy sehingga IP tidak diblokir Cloudflare.
 """
 import asyncio
 import io
@@ -25,6 +25,15 @@ SOCKET_URL = "https://ivasms.com:2087"
 _FS_INTERNAL = "http://flaresolverr.railway.internal:8191"
 _FS_EXTERNAL = os.environ.get("FLARESOLVERR_URL", "")
 FLARESOLVERR_URL = _FS_INTERNAL  # default pakai internal Railway network
+
+# SOCKS5 Residential Proxy — bypass Cloudflare IP blocking
+# Set env var PROXY_URL di Railway, format: socks5://user:pass@host:port
+PROXY_URL = os.environ.get("PROXY_URL", "")
+_PROXIES = {"all": PROXY_URL} if PROXY_URL else None
+if PROXY_URL:
+    logger.info(f"Proxy aktif: {PROXY_URL.split('@')[-1] if '@' in PROXY_URL else PROXY_URL}")
+else:
+    logger.warning("PROXY_URL tidak diset — request langsung (bisa kena CF block)")
 
 # ── Country name → emoji ────────────────────────────────────────────────────
 
@@ -292,8 +301,8 @@ async def _login_via_flaresolverr(email: str, password: str, fs_url: str) -> dic
         f"_login_via_flaresolverr: CF cookies={list(cf_cookies.keys())}, CSRF={csrf_token[:10]}..."
     )
 
-    # Step 2: POST /login via curl_cffi dengan CF cookies (sama IP Railway = cf_clearance valid)
-    sess = CurlSession(impersonate="chrome131", headers={**DEFAULT_HEADERS, "User-Agent": ua})
+    # Step 2: POST /login via curl_cffi dengan CF cookies + proxy residential
+    sess = CurlSession(impersonate="chrome131", headers={**DEFAULT_HEADERS, "User-Agent": ua}, proxies=_PROXIES)
     try:
         sess.cookies.update(cf_cookies)
         await asyncio.sleep(1)
@@ -354,7 +363,7 @@ async def _login_via_curl_cffi(email: str, password: str) -> dict | None:
 
     for imp in impersonate_versions:
         logger.info(f"_login_via_curl_cffi: mencoba dengan {imp}")
-        sess = CurlSession(impersonate=imp, headers=DEFAULT_HEADERS)
+        sess = CurlSession(impersonate=imp, headers=DEFAULT_HEADERS, proxies=_PROXIES)
         try:
             resp = await sess.get(
                 f"{IVASMS_BASE_URL}/login",
@@ -468,7 +477,7 @@ class IVASMSClient:
     async def open(self):
         if self.session and not self.session.closed:
             return
-        self.session = CurlSession(impersonate="chrome131", headers=DEFAULT_HEADERS)
+        self.session = CurlSession(impersonate="chrome131", headers=DEFAULT_HEADERS, proxies=_PROXIES)
         self._apply_cookies()
 
     async def close(self):
