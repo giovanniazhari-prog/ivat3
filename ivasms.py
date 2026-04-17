@@ -10,6 +10,7 @@ import urllib.parse
 from datetime import date
 
 import aiohttp
+from curl_cffi.requests import AsyncSession as CurlSession
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,7 @@ async def _get_cookies_via_flaresolverr(url: str, flaresolverr_url: str) -> dict
                     "url": url,
                     "maxTimeout": 60000,
                 },
-                timeout=aiohttp.ClientTimeout(total=70),
+                timeout=70,
             ) as resp:
                 data = await resp.json()
                 cookies = {}
@@ -195,26 +196,20 @@ class IVASMSClient:
     def __init__(self, cookies_raw: str):
         self.cookies: dict[str, str] = parse_cookies(cookies_raw)
         self.csrf_token: str | None = None
-        self.session: aiohttp.ClientSession | None = None
+        self.session: CurlSession | None = None
 
     async def open(self):
         if self.session and not self.session.closed:
             return
-        connector = aiohttp.TCPConnector(
-            ssl=True,
-            limit=10,
-            ttl_dns_cache=300,
-        )
-        self.session = aiohttp.ClientSession(
-            headers=DEFAULT_HEADERS,
-            connector=connector,
-            cookie_jar=aiohttp.CookieJar(unsafe=True),
-        )
+        self.session = CurlSession(impersonate="chrome124", headers=DEFAULT_HEADERS)
         self._apply_cookies()
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        if self.session:
+            try:
+                self.session.close()
+            except Exception:
+                pass
         self.session = None
         self.csrf_token = None
 
@@ -226,56 +221,70 @@ class IVASMSClient:
         await self.close()
 
     def _apply_cookies(self):
-        for name, value in self.cookies.items():
-            self.session.cookie_jar.update_cookies({name: value})
+        if self.session:
+            self.session.cookies.update(self.cookies)
 
     def get_updated_cookies_str(self) -> str:
         if not self.session:
             return json.dumps(self.cookies) if self.cookies else ""
         merged = dict(self.cookies)
-        for c in self.session.cookie_jar:
-            if c.key and c.value:
-                merged[c.key] = c.value
+        try:
+            for name, value in self.session.cookies.items():
+                if name and value:
+                    merged[name] = value
+        except Exception:
+            pass
         return json.dumps(merged) if merged else ""
 
     async def login(self) -> bool:
-        """Login check + ambil CSRF token dari halaman sms/received."""
-        # Solve Cloudflare challenge via FlareSolverr sebelum hit iVAS
-        cf_cookies = await _get_cookies_via_flaresolverr(IVASMS_BASE_URL, FLARESOLVERR_URL)
-        if cf_cookies:
-            self.cookies.update(cf_cookies)
-        self._apply_cookies()
-        # Warm-up: hit homepage dulu biar traffic keliatan natural ke CF
+        """Login via FlareSolverr — real Chromium, bypass CF TLS fingerprinting."""
+        # Kirim cookies user ke FlareSolverr agar dia load halaman pakai Chrome beneran
+        fs_cookies = []
+        for name, value in self.cookies.items():
+            domain = ".ivasms.com" if name in ("cf_clearance", "_fbp", "__cf_bm") else "www.ivasms.com"
+            fs_cookies.append({"name": name, "value": value, "domain": domain, "path": "/"})
+
         try:
-            async with self.session.get(
-                IVASMS_BASE_URL,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as _:
-                pass
-            await asyncio.sleep(1.5)
-        except Exception:
-            pass
-        try:
-            async with self.session.get(
-                f"{IVASMS_BASE_URL}/portal/sms/received",
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"login: HTTP {resp.status}")
-                    return False
-                html = await resp.text()
-                m = re.search(r'name="_token"\s+value="([^"]+)"', html)
-                if m:
-                    self.csrf_token = m.group(1)
-                    logger.info("Login OK — CSRF acquired")
-                    return True
-                logger.error("CSRF not found — cookies mungkin expired")
-                return False
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    f"{FLARESOLVERR_URL}/v1",
+                    json={
+                        "cmd": "request.get",
+                        "url": f"{IVASMS_BASE_URL}/portal/sms/received",
+                        "maxTimeout": 60000,
+                        "cookies": fs_cookies,
+                    },
+                    timeout=75,
+                ) as resp:
+                    data = await resp.json()
         except Exception as e:
-            logger.error(f"login error: {e}")
+            logger.error(f"login FlareSolverr error: {e}")
             return False
+
+        solution = data.get("solution", {})
+        status = solution.get("status", 0)
+        html = solution.get("response", "")
+        final_url = solution.get("url", "")
+
+        # Merge semua cookies dari FlareSolverr (CF clearance + session) ke session kita
+        for ck in solution.get("cookies", []):
+            name, value = ck.get("name"), ck.get("value")
+            if name and value:
+                self.cookies[name] = value
+        self._apply_cookies()
+
+        if "/login" in final_url or status != 200:
+            logger.error(f"login via FS: HTTP {status}, url={final_url}")
+            return False
+
+        m = re.search(r'name="_token"\s+value="([^"]+)"', html)
+        if m:
+            self.csrf_token = m.group(1)
+            logger.info("Login OK via FlareSolverr — CSRF acquired")
+            return True
+
+        logger.error("CSRF not found — cookies mungkin expired")
+        return False
 
     async def keepalive(self) -> bool:
         """
@@ -285,26 +294,29 @@ class IVASMSClient:
         Returns True kalau session masih valid.
         """
         try:
-            async with self.session.get(
+            resp = await self.session.get(
                 f"{IVASMS_BASE_URL}/portal/dashboard",
                 allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                html = await resp.text()
-                # Kalau diredirect ke /login berarti session sudah mati
-                if "/login" in str(resp.url):
-                    logger.warning("keepalive: session expired (redirected to login)")
-                    return False
-                # Update cookies dari jar
-                for c in self.session.cookie_jar:
-                    if c.key and c.value:
-                        self.cookies[c.key] = c.value
-                # Update CSRF kalau ada di halaman
-                m = re.search(r'name="_token"\s+value="([^"]+)"', html)
-                if m:
-                    self.csrf_token = m.group(1)
-                logger.info("keepalive: session OK, cookies updated")
-                return True
+                timeout=15,
+            )
+            html = resp.text
+            # Kalau diredirect ke /login berarti session sudah mati
+            if "/login" in str(resp.url):
+                logger.warning("keepalive: session expired (redirected to login)")
+                return False
+            # Update cookies dari session
+            try:
+                for name, value in self.session.cookies.items():
+                    if name and value:
+                        self.cookies[name] = value
+            except Exception:
+                pass
+            # Update CSRF kalau ada di halaman
+            m = re.search(r'name="_token"\s+value="([^"]+)"', html)
+            if m:
+                self.csrf_token = m.group(1)
+            logger.info("keepalive: session OK, cookies updated")
+            return True
         except Exception as e:
             logger.error(f"keepalive: {e}")
             return False
@@ -340,13 +352,13 @@ class IVASMSClient:
             "Referer": f"{IVASMS_BASE_URL}/portal/sms/test/sms",
         }
         try:
-            async with self.session.get(
-                url, headers=hdrs, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"get_wa_active_ranges: HTTP {resp.status}")
-                    return []
-                data = await resp.json(content_type=None)
+            resp = await self.session.get(
+                url, headers=hdrs, timeout=30
+            )
+            if resp.status_code != 200:
+                logger.error(f"get_wa_active_ranges: HTTP {resp.status_code}")
+                return []
+            data = resp.json()
         except Exception as e:
             logger.error(f"get_wa_active_ranges error: {e}")
             return []
@@ -399,24 +411,24 @@ class IVASMSClient:
         }
         for attempt in range(retry_on_429 + 1):
             try:
-                async with self.session.post(
+                resp = await self.session.post(
                     f"{IVASMS_BASE_URL}/portal/numbers/termination/number/add",
                     data=payload, headers=hdrs,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 429:
-                        wait = 5 * (attempt + 1)   # 5s, 10s, 15s
-                        logger.warning(f"add_range: 429 rate limit, tunggu {wait}s (attempt {attempt+1}/{retry_on_429+1})")
-                        if attempt < retry_on_429:
-                            await asyncio.sleep(wait)
-                            continue
-                        return {"ok": False, "message": "HTTP 429 (rate limited, max retry)"}
-                    if resp.status != 200:
-                        return {"ok": False, "message": f"HTTP {resp.status}"}
-                    j = await resp.json(content_type=None)
-                    msg = j.get("message", "OK")
-                    ok = "error" not in msg.lower()
-                    return {"ok": ok, "message": msg}
+                    timeout=15,
+                )
+                if resp.status_code == 429:
+                    wait = 5 * (attempt + 1)   # 5s, 10s, 15s
+                    logger.warning(f"add_range: 429 rate limit, tunggu {wait}s (attempt {attempt+1}/{retry_on_429+1})")
+                    if attempt < retry_on_429:
+                        await asyncio.sleep(wait)
+                        continue
+                    return {"ok": False, "message": "HTTP 429 (rate limited, max retry)"}
+                if resp.status_code != 200:
+                    return {"ok": False, "message": f"HTTP {resp.status_code}"}
+                j = resp.json()
+                msg = j.get("message", "OK")
+                ok = "error" not in msg.lower()
+                return {"ok": ok, "message": msg}
             except Exception as e:
                 logger.error(f"add_range({termination_id}): {e}")
                 return {"ok": False, "message": str(e)}
@@ -439,18 +451,18 @@ class IVASMSClient:
         }
         payload = {"_token": self.csrf_token}
         try:
-            async with self.session.post(
+            resp = await self.session.post(
                 f"{IVASMS_BASE_URL}/portal/numbers/return/allnumber/bluck",
                 data=payload, headers=hdrs,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    return {"ok": False, "count": 0, "message": f"HTTP {resp.status}"}
-                j = await resp.json(content_type=None)
-                msg   = j.get("message", "")
-                count = j.get("count", 0)
-                ok    = "successfully" in msg.lower() or count > 0
-                return {"ok": ok, "count": count, "message": msg}
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return {"ok": False, "count": 0, "message": f"HTTP {resp.status_code}"}
+            j = resp.json()
+            msg   = j.get("message", "")
+            count = j.get("count", 0)
+            ok    = "successfully" in msg.lower() or count > 0
+            return {"ok": ok, "count": count, "message": msg}
         except Exception as e:
             logger.error(f"bulk_return_all: {e}")
             return {"ok": False, "count": 0, "message": str(e)}
@@ -460,21 +472,21 @@ class IVASMSClient:
     async def download_xlsx(self) -> bytes | None:
         """GET /portal/numbers/export → XLSX bytes"""
         try:
-            async with self.session.get(
+            resp = await self.session.get(
                 f"{IVASMS_BASE_URL}/portal/numbers/export",
                 headers={"Referer": f"{IVASMS_BASE_URL}/portal/numbers"},
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=60,
                 allow_redirects=True,
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"download_xlsx: HTTP {resp.status}")
-                    return None
-                data = await resp.read()
-                if len(data) < 100:
-                    logger.warning(f"download_xlsx: terlalu kecil ({len(data)} bytes)")
-                    return None
-                logger.info(f"download_xlsx: {len(data)} bytes OK")
-                return data
+            )
+            if resp.status_code != 200:
+                logger.error(f"download_xlsx: HTTP {resp.status_code}")
+                return None
+            data = resp.content
+            if len(data) < 100:
+                logger.warning(f"download_xlsx: terlalu kecil ({len(data)} bytes)")
+                return None
+            logger.info(f"download_xlsx: {len(data)} bytes OK")
+            return data
         except Exception as e:
             logger.error(f"download_xlsx: {e}")
             return None
@@ -492,15 +504,15 @@ class IVASMSClient:
             "&search[value]=&search[regex]=false"
         )
         try:
-            async with self.session.get(
+            resp = await self.session.get(
                 f"{IVASMS_BASE_URL}/portal/numbers?{params}",
                 headers={**JSON_HEADERS, "X-XSRF-TOKEN": xsrf},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return -1
-                d = await resp.json(content_type=None)
-                return int(d.get("recordsTotal", -1))
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return -1
+            d = resp.json()
+            return int(d.get("recordsTotal", -1))
         except Exception as e:
             logger.error(f"get_my_numbers_count: {e}")
             return -1
@@ -516,14 +528,14 @@ class IVASMSClient:
         Returns None kalau gagal.
         """
         try:
-            async with self.session.get(
+            resp = await self.session.get(
                 f"{IVASMS_BASE_URL}/portal/live/my_sms",
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"get_live_sms_socket_params: HTTP {resp.status}")
-                    return None
-                html = await resp.text()
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.error(f"get_live_sms_socket_params: HTTP {resp.status_code}")
+                return None
+            html = resp.text
         except Exception as e:
             logger.error(f"get_live_sms_socket_params: {e}")
             return None
@@ -575,33 +587,33 @@ class IVASMSClient:
             "Referer": f"{IVASMS_BASE_URL}/portal/sms/received",
         }
         try:
-            async with self.session.post(
+            resp = await self.session.post(
                 f"{IVASMS_BASE_URL}/portal/sms/received/getsms",
                 data=payload, headers=hdrs,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"get_received_sms_today: HTTP {resp.status}")
-                    return []
-                html = await resp.text()
-                sms_list = []
-                rows = re.findall(
-                    r'<tr[^>]*>([\s\S]*?)</tr>',
-                    html,
-                    re.IGNORECASE,
-                )
-                for row in rows:
-                    cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row, re.IGNORECASE)
-                    if len(cells) >= 3:
-                        def strip_tags(s):
-                            return re.sub(r'<[^>]+>', '', s).strip()
-                        sms_list.append({
-                            "number": strip_tags(cells[0]),
-                            "originator": strip_tags(cells[1]) if len(cells) > 1 else "",
-                            "message": strip_tags(cells[2]) if len(cells) > 2 else "",
-                            "time": strip_tags(cells[3]) if len(cells) > 3 else "",
-                        })
-                return sms_list
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.error(f"get_received_sms_today: HTTP {resp.status_code}")
+                return []
+            html = resp.text
+            sms_list = []
+            rows = re.findall(
+                r'<tr[^>]*>([\s\S]*?)</tr>',
+                html,
+                re.IGNORECASE,
+            )
+            for row in rows:
+                cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row, re.IGNORECASE)
+                if len(cells) >= 3:
+                    def strip_tags(s):
+                        return re.sub(r'<[^>]+>', '', s).strip()
+                    sms_list.append({
+                        "number": strip_tags(cells[0]),
+                        "originator": strip_tags(cells[1]) if len(cells) > 1 else "",
+                        "message": strip_tags(cells[2]) if len(cells) > 2 else "",
+                        "time": strip_tags(cells[3]) if len(cells) > 3 else "",
+                    })
+            return sms_list
         except Exception as e:
             logger.error(f"get_received_sms_today: {e}")
             return []
