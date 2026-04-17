@@ -190,6 +190,93 @@ async def _get_cookies_via_flaresolverr(url: str, flaresolverr_url: str) -> dict
         return {}
 
 
+
+async def login_with_credentials(email: str, password: str) -> dict | None:
+    """
+    Login ke ivasms.com menggunakan email dan password.
+    Step 1: FlareSolverr GET /login  → dapat cf_clearance + CSRF token
+    Step 2: curl_cffi POST /login    → dapat session cookies
+    Returns: cookies dict kalau sukses, None kalau gagal.
+    """
+    # Step 1: GET halaman login via FlareSolverr (real Chromium, bypass CF)
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{FLARESOLVERR_URL}/v1",
+                json={"cmd": "request.get", "url": f"{IVASMS_BASE_URL}/login", "maxTimeout": 60000},
+                timeout=aiohttp.ClientTimeout(total=75),
+            ) as resp:
+                data = await resp.json()
+    except Exception as e:
+        logger.error(f"login_with_credentials: FlareSolverr GET error: {e}")
+        return None
+
+    solution = data.get("solution", {})
+    if solution.get("status") != 200:
+        logger.error(f"login_with_credentials: FlareSolverr GET failed status={solution.get('status')}")
+        return None
+
+    html_page = solution.get("response", "")
+    m = re.search(r'name="_token"\s+value="([^"]+)"', html_page)
+    if not m:
+        logger.error("login_with_credentials: CSRF token tidak ada di halaman login")
+        return None
+
+    csrf_token = m.group(1)
+    ua = solution.get("userAgent") or DEFAULT_HEADERS["User-Agent"]
+
+    # Extract CF cookies dari FlareSolverr
+    cf_cookies: dict[str, str] = {}
+    for ck in solution.get("cookies", []):
+        n, v = ck.get("name"), ck.get("value")
+        if n and v:
+            cf_cookies[n] = v
+    logger.info(f"login_with_credentials: CF cookies: {list(cf_cookies.keys())}, CSRF={csrf_token[:10]}...")
+
+    # Step 2: POST login via curl_cffi dengan CF cookies (sama IP Railway = cf_clearance valid)
+    sess = CurlSession(impersonate="chrome124", headers={**DEFAULT_HEADERS, "User-Agent": ua})
+    try:
+        sess.cookies.update(cf_cookies)
+        resp = await sess.post(
+            f"{IVASMS_BASE_URL}/login",
+            data={
+                "_token": csrf_token,
+                "email": email,
+                "password": password,
+                "remember": "on",
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{IVASMS_BASE_URL}/login",
+                "Origin": IVASMS_BASE_URL,
+            },
+            allow_redirects=True,
+            timeout=30,
+        )
+        final_url = str(resp.url)
+        logger.info(f"login_with_credentials: POST → url={final_url} status={resp.status_code}")
+
+        if "/login" in final_url:
+            logger.error("login_with_credentials: masih di /login — credentials salah atau CF blok")
+            return None
+
+        # Merge semua cookies
+        result: dict[str, str] = dict(cf_cookies)
+        for name, value in sess.cookies.items():
+            if name and value:
+                result[name] = value
+        logger.info(f"login_with_credentials: sukses! cookies={list(result.keys())}")
+        return result
+    except Exception as e:
+        logger.error(f"login_with_credentials: curl_cffi POST error: {e}")
+        return None
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
 # ── iVAS HTTP Client ─────────────────────────────────────────────────────────
 
 class IVASMSClient:
