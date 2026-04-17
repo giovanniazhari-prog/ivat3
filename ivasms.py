@@ -285,20 +285,28 @@ async def _fs_login_full(
     csrf_token: str,
     fs_url: str,
     session_id: str,
+    cookies: list[dict] | None = None,
+    turnstile_token: str = "",
 ) -> dict | None:
     """POST login via FlareSolverr persistent session (sama browser = same cf_clearance)."""
+    payload = {
+        "_token": csrf_token,
+        "email": email,
+        "password": password,
+        "remember": "on",
+        "submit": "register",
+    }
+    if turnstile_token:
+        payload["cf-turnstile-response"] = turnstile_token
     body = {
         "cmd": "request.post",
         "url": f"{IVASMS_BASE_URL}/login",
         "session": session_id,
-        "postData": urllib.parse.urlencode({
-            "_token": csrf_token,
-            "email": email,
-            "password": password,
-            "remember": "on",
-        }),
+        "postData": urllib.parse.urlencode(payload),
         "maxTimeout": 60000,
     }
+    if cookies:
+        body["cookies"] = cookies
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -380,17 +388,36 @@ async def _login_via_flaresolverr(email: str, password: str, fs_url: str) -> dic
             return None
 
         csrf_token = m.group(1)
+        turnstile_match = re.search(
+            r'name="cf-turnstile-response"[^>]*value="([^"]*)"', html_page
+        )
+        turnstile_token = turnstile_match.group(1) if turnstile_match else ""
         get_cookies: dict[str, str] = {}
+        fs_cookies: list[dict] = []
         for ck in solution.get("cookies", []):
             n, v = ck.get("name"), ck.get("value")
             if n and v:
                 get_cookies[n] = v
+                fs_cookies.append({
+                    "name": n,
+                    "value": v,
+                    "domain": ck.get("domain") or ".ivasms.com",
+                    "path": ck.get("path") or "/",
+                })
 
         logger.info(
-            f"_login_via_flaresolverr: session={session_id}, cookies={list(get_cookies.keys())}, CSRF={csrf_token[:10]}..."
+            f"_login_via_flaresolverr: session={session_id}, cookies={list(get_cookies.keys())}, CSRF={csrf_token[:10]}..., turnstile={'ada' if turnstile_token else 'kosong'}"
         )
 
-        post_solution = await _fs_login_full(email, password, csrf_token, fs_url, session_id)
+        post_solution = await _fs_login_full(
+            email,
+            password,
+            csrf_token,
+            fs_url,
+            session_id,
+            cookies=fs_cookies,
+            turnstile_token=turnstile_token,
+        )
         if not post_solution:
             return None
 
@@ -400,10 +427,15 @@ async def _login_via_flaresolverr(email: str, password: str, fs_url: str) -> dic
 
         if "/login" in final_url:
             body = post_solution.get("response", "")
-            if any(kw in body.lower() for kw in ["invalid", "incorrect", "salah", "wrong"]):
+            body_lower = body.lower()
+            if "page expired" in body_lower:
+                logger.error("_login_via_flaresolverr: login ditolak karena CSRF/session expired")
+            elif "security verification failed" in body_lower:
+                logger.error("_login_via_flaresolverr: login ditolak oleh Turnstile/security verification")
+            elif any(kw in body_lower for kw in ["invalid", "incorrect", "salah", "wrong"]):
                 logger.error("_login_via_flaresolverr: credentials tidak valid")
             else:
-                logger.warning("_login_via_flaresolverr: masih di /login — CF masih blok POST")
+                logger.warning("_login_via_flaresolverr: masih di /login setelah POST")
             return None
 
         result: dict[str, str] = dict(get_cookies)
