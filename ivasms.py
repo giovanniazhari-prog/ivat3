@@ -20,6 +20,10 @@ SOCKET_URL = "https://ivasms.com:2087"
 # Browser impersonation target — Chrome terbaru yang tersedia
 IMPERSONATE = "chrome136"
 
+# Proxy untuk bypass Cloudflare IP restriction
+PROXY_URL = "http://CYYGqoeOvJ90_custom_zone_ID_st__city_sid_59267953_time_90:2856736@change4.owlproxy.com:7778"
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL}
+
 # ── Country name → emoji ────────────────────────────────────────────────────
 
 _NAME_TO_EMOJI: dict[str, str] = {
@@ -173,6 +177,7 @@ class IVASMSClient:
             cookies=self.cookies,
             timeout=30,
             allow_redirects=True,
+            proxies=PROXIES,
         )
 
     async def close(self):
