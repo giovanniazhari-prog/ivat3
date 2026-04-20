@@ -2,6 +2,9 @@
 iVAS OTP Bot — Full-featured Telegram Bot
 Button UI: Scan → pilih negara → Add top 10 range → Kirim TXT → Monitor OTP live
 """
+# Note: aiohttp monkey-patch untuk ClientWSTimeout dihapus
+# karena ivasms.py sekarang pakai curl_cffi (bypass Cloudflare).
+# aiohttp tetap dipakai oleh aiogram (Telegram) dan python-socketio.
 import aiohttp as _aiohttp_patch
 if not hasattr(_aiohttp_patch, 'ClientWSTimeout'):
     class _FakeWSTimeout:
@@ -43,7 +46,6 @@ load_dotenv()
 import database
 from ivasms import (
     IVASMSClient,
-    login_with_credentials,
     _country_emoji,
     xlsx_bytes_to_numbers,
     numbers_to_txt,
@@ -324,6 +326,27 @@ async def kb_status(msg: Message):
     )
 
 
+# ── Cloudflare blocked message helper ─────────────────────────────────────────
+
+CF_BLOCKED_MSG = (
+    f"<b>🛡️ Diblokir Cloudflare!</b>\n{SEP}\n"
+    f"ivasms.com pakai Cloudflare JS Challenge.\n"
+    f"Cookie <b>cf_clearance</b> wajib disertakan!\n\n"
+    f"<b>Cara ambil cookies (PC):</b>\n"
+    f"1️⃣  Buka <b>ivasms.com</b> di Chrome\n"
+    f"2️⃣  Tunggu sampai halaman load sempurna\n"
+    f"3️⃣  Tekan <b>F12</b> → tab <b>Application</b>\n"
+    f"4️⃣  Klik <b>Cookies</b> → <b>ivasms.com</b>\n"
+    f"5️⃣  Copy <b>SEMUA</b> cookies ini:\n"
+    f"    • <code>cf_clearance</code> ← <b>WAJIB!</b>\n"
+    f"    • <code>XSRF-TOKEN</code>\n"
+    f"    • <code>ivas_sms_session</code>\n\n"
+    f"<b>Format kirim:</b>\n"
+    f"<code>/setcookies cf_clearance=xxx; XSRF-TOKEN=xxx; ivas_sms_session=xxx</code>\n\n"
+    f"⚠️ <i>cf_clearance berlaku ~30 menit - 24 jam</i>"
+)
+
+
 # ── Set Cookies ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == "🍪 Set Cookies")
@@ -334,10 +357,19 @@ async def kb_setcookies_prompt(msg: Message):
     await msg.answer(
         f"<b>🍪 Set Cookies iVAS</b>\n{SEP}\n"
         f"Gunakan: <code>/setcookies [cookies]</code>\n\n"
-        f"<b>Format JSON array:</b>\n"
-        f"<code>[{{\"name\":\"XSRF-TOKEN\",\"value\":\"...\"}},{{\"name\":\"ivas_sms_session\",\"value\":\"...\"}}]</code>\n\n"
-        f"<b>Cara ambil (PC):</b>\n"
-        f"F12 → Application → Cookies → copy XSRF-TOKEN + ivas_sms_session",
+        f"<b>⚠️ PENTING — Cloudflare Protection:</b>\n"
+        f"Harus include cookie <b>cf_clearance</b>!\n\n"
+        f"<b>Cara ambil (PC — Chrome):</b>\n"
+        f"1. Buka ivasms.com, tunggu load\n"
+        f"2. F12 → Application → Cookies\n"
+        f"3. Copy <b>3 cookies</b> ini:\n"
+        f"   • <code>cf_clearance</code> ← wajib!\n"
+        f"   • <code>XSRF-TOKEN</code>\n"
+        f"   • <code>ivas_sms_session</code>\n\n"
+        f"<b>Format 1 (semicolon):</b>\n"
+        f"<code>/setcookies cf_clearance=xxx; XSRF-TOKEN=xxx; ivas_sms_session=xxx</code>\n\n"
+        f"<b>Format 2 (JSON array):</b>\n"
+        f'<code>[{{"name":"cf_clearance","value":"..."}},{{"name":"XSRF-TOKEN","value":"..."}},{{"name":"ivas_sms_session","value":"..."}}]</code>',
         parse_mode="HTML",
     )
 
@@ -356,20 +388,29 @@ async def cmd_setcookies(msg: Message):
 
 async def _process_cookies(msg: Message, raw: str):
     info = await msg.answer("⏳ Ngecek cookies ke iVAS...")
-    ok = False
+    login_result = "error"
     try:
         async with IVASMSClient(raw) as client:
-            ok = await client.login()
-            if ok:
+            login_result = await client.login()
+            if login_result == "ok":
                 updated = client.get_updated_cookies_str()
                 if updated:
                     raw = updated
     except Exception as e:
         logger.error(f"cookies validate: {e}")
-    if not ok:
+
+    if login_result == "cloudflare":
+        await info.edit_text(CF_BLOCKED_MSG, parse_mode="HTML")
+        return
+    if login_result != "ok":
         await info.edit_text(
             f"<b>❌ Cookies Ditolak!</b>\n{SEP}\n"
-            f"Tidak valid atau expired. Login ulang ke ivasms.com dan ambil cookies baru.",
+            f"Tidak valid atau expired.\n"
+            f"Login ulang ke ivasms.com dan ambil cookies baru.\n\n"
+            f"<b>Pastikan include cookie:</b>\n"
+            f"• <code>cf_clearance</code>\n"
+            f"• <code>XSRF-TOKEN</code>\n"
+            f"• <code>ivas_sms_session</code>",
             parse_mode="HTML",
         )
         return
@@ -382,131 +423,6 @@ async def _process_cookies(msg: Message, raw: str):
             [InlineKeyboardButton(text="📡 Scan Range WA Sekarang", callback_data="scan_range")]
         ]),
     )
-
-
-@router.message(Command("autologin"))
-async def cmd_autologin(msg: Message):
-    if not is_admin(msg.from_user.id):
-        await deny(msg)
-        return
-    parts = msg.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await msg.answer(
-            "Gunakan: <code>/autologin email password</code>\n\nContoh:\n<code>/autologin ntazis72@gmail.com Azis12345_</code>",
-            parse_mode="HTML",
-        )
-        return
-    _, email, password = parts
-    info = await msg.answer(
-        "⏳ <b>Sedang login ke iVAS...</b>\n"
-        "<i>Menggunakan Chrome impersonation untuk bypass Cloudflare.\n"
-        "Proses ini bisa memakan waktu 30–60 detik...</i>",
-        parse_mode="HTML",
-    )
-    try:
-        cookies = await login_with_credentials(email.strip(), password.strip())
-    except Exception as e:
-        logger.error(f"autologin error: {e}")
-        cookies = None
-    if not cookies:
-        await info.edit_text(
-            "<b>❌ Login Gagal!</b>\n\n"
-            "Kemungkinan penyebab:\n"
-            "• Email atau password salah\n"
-            "• Verifikasi keamanan iVAS/Turnstile menolak login otomatis\n"
-            "• Cloudflare masih memblok IP Railway\n"
-            "• Rate limit (coba lagi dalam 1-2 menit)\n\n"
-            "<b>Alternatif:</b> Login manual ke ivasms.com di browser,\n"
-            "lalu copy cookies via F12 → Application → Cookies\n"
-            "dan kirim ke bot dengan: <code>/setcookies [cookies]</code>",
-            parse_mode="HTML",
-        )
-        return
-    raw = json.dumps(cookies)
-    # Validasi cookies yang baru didapat
-    login_ok = False
-    try:
-        async with IVASMSClient(raw) as client:
-            login_ok = await client.login()
-            if login_ok:
-                updated = client.get_updated_cookies_str()
-                if updated:
-                    raw = updated
-    except Exception as e:
-        logger.error(f"autologin validate: {e}")
-    uid = msg.from_user.id
-    database.set_setting(f"ivasms_cookies_{uid}", raw)
-    if login_ok:
-        await info.edit_text(
-            f"<b>✅ Auto Login Berhasil!</b>\n{SEP}\n"
-            f"🍪 Cookies tersimpan & terverifikasi.\n"
-            f"Bot siap digunakan! 🚀",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📡 Scan Range WA Sekarang", callback_data="scan_range")]
-            ]),
-        )
-    else:
-        await info.edit_text(
-            f"<b>⚠️ Login Berhasil tapi Verifikasi Partial</b>\n{SEP}\n"
-            f"Cookies disimpan, tapi verifikasi session gagal.\n"
-            f"Kemungkinan CF masih aktif untuk beberapa endpoint.\n\n"
-            f"Coba gunakan fitur bot dan lihat apakah berfungsi.\n"
-            f"Jika tidak, coba <code>/autologin</code> sekali lagi.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📡 Scan Range WA", callback_data="scan_range")]
-            ]),
-        )
-
-
-@router.message(Command("testcookies"))
-async def cmd_testcookies(msg: Message):
-    """Test apakah cookies yang tersimpan masih valid."""
-    if not is_admin(msg.from_user.id):
-        await deny(msg)
-        return
-    uid = msg.from_user.id
-    cookies = get_cookies(uid)
-    if not cookies:
-        await msg.answer(
-            "🔴 Belum ada cookies tersimpan.\n"
-            "Gunakan /autologin atau 🍪 Set Cookies dulu.",
-        )
-        return
-    info = await msg.answer("⏳ Mengecek cookies ke iVAS...")
-    try:
-        async with IVASMSClient(cookies) as client:
-            ok = await client.login()
-            if ok:
-                updated = client.get_updated_cookies_str()
-                if updated:
-                    database.set_setting(f"ivasms_cookies_{uid}", updated)
-                csrf = "✅ Ada" if client.csrf_token else "⚠️ Tidak ada"
-                cookie_keys = list(client.cookies.keys())
-                has_cf = "cf_clearance" in cookie_keys
-                await info.edit_text(
-                    f"<b>✅ Cookies Valid!</b>\n{SEP}\n"
-                    f"🔑 CSRF Token : {csrf}\n"
-                    f"🛡 CF Clearance: {'✅' if has_cf else '❌'}\n"
-                    f"🍪 Cookie keys : <code>{', '.join(cookie_keys[:8])}</code>\n\n"
-                    f"Session iVAS aktif & siap digunakan.",
-                    parse_mode="HTML",
-                )
-            else:
-                await info.edit_text(
-                    f"<b>❌ Cookies Tidak Valid / Expired!</b>\n{SEP}\n"
-                    f"Session sudah berakhir.\n\n"
-                    f"Gunakan:\n"
-                    f"• <code>/autologin email password</code>\n"
-                    f"• atau 🍪 Set Cookies (manual dari browser)",
-                    parse_mode="HTML",
-                )
-    except Exception as e:
-        await info.edit_text(
-            f"<b>❌ Error saat cek cookies:</b>\n<code>{str(e)[:200]}</code>",
-            parse_mode="HTML",
-        )
 
 
 # ── Scan Range WA — STEP 1: Scan & tampil negara ─────────────────────────────
@@ -740,10 +656,13 @@ async def cb_add_country(cb: CallbackQuery):
 
     try:
         async with IVASMSClient(cookies) as client:
-            ok = await client.login()
-            if not ok:
+            login_result = await client.login()
+            if login_result == "cloudflare":
+                await info.edit_text(CF_BLOCKED_MSG, parse_mode="HTML")
+                return
+            if login_result != "ok":
                 await info.edit_text(
-                    f"<b>❌ Login iVAS Gagal</b>\n{SEP}\nCookies expired!",
+                    f"<b>❌ Login iVAS Gagal</b>\n{SEP}\nCookies expired! Set ulang via 🍪 Set Cookies.",
                     parse_mode="HTML",
                 )
                 return
@@ -895,10 +814,13 @@ async def cb_confirm_return_all(cb: CallbackQuery):
 
     try:
         async with IVASMSClient(cookies) as client:
-            ok = await client.login()
-            if not ok:
+            login_result = await client.login()
+            if login_result == "cloudflare":
+                await info.edit_text(CF_BLOCKED_MSG, parse_mode="HTML")
+                return
+            if login_result != "ok":
                 await info.edit_text(
-                    f"<b>❌ Login iVAS Gagal</b>\n{SEP}\nCookies expired!",
+                    f"<b>❌ Login iVAS Gagal</b>\n{SEP}\nCookies expired! Set ulang via 🍪 Set Cookies.",
                     parse_mode="HTML",
                 )
                 return
